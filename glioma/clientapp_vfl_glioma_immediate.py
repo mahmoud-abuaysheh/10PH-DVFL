@@ -1,0 +1,212 @@
+# clientapp_vfl_glioma_splitnn.py  — matches DIA SplitNN pattern exactly
+#
+# Key fixes vs previous glioma client:
+#   FIX-A: No embedding cache across messages. apply_gradients does a fresh
+#           forward pass (same as DIA). This is correct because model weights
+#           haven't changed between generate_embeddings and apply_gradients
+#           within the same step, and Ray may dispatch them to different actors.
+#   FIX-B: generate_embeddings always runs under no_grad + eval (DIA pattern).
+#           Gradient computation happens in apply_gradients fresh forward.
+#   FIX-D: No checkpoint_bottom / restore_best_bottom needed — server handles
+#           head checkpointing; bottoms are checkpointed here on request.
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import os
+import torch
+import torch.nn as nn
+from flwr.app import Array, ArrayRecord, ConfigRecord, Context, Message, RecordDict
+from flwr.clientapp import ClientApp
+
+_CACHE: Dict[str, Dict] = {}
+
+
+def _cache_key(context: Context) -> str:
+    nid = getattr(context, "node_id", None)
+    return str(nid) if nid is not None else str(id(context))
+
+
+def _get_cache(context: Context) -> Dict:
+    key = _cache_key(context)
+    if key not in _CACHE:
+        _CACHE[key] = {}
+    return _CACHE[key]
+
+
+def set_seed(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+class BottomMLP(nn.Module):
+    """Matches decoupled Glioma bottom exactly: in_dim → 32 → out_dim (default 16)."""
+    def __init__(self, in_dim: int, out_dim: int = 16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def load_npz(npz_path: str):
+    d     = np.load(npz_path, allow_pickle=True)
+    X1    = d["X1"].astype(np.float32)
+    X2    = d["X2"].astype(np.float32)
+    y     = d["y"].astype(np.int64)
+    folds = list(d["folds"])
+    return X1, X2, y, folds
+
+
+def _init_if_needed(context: Context) -> None:
+    cache = _get_cache(context)
+    if cache.get("ready", False):
+        return
+
+    DEFAULT_NPZ = Path(__file__).resolve().parent / "glioma_aligned_vfl_hfl_cv.npz"
+    rc      = getattr(context, "run_config", {}) or {}
+    npz:    str   = str(rc.get("npz", str(DEFAULT_NPZ)))
+    fold:   int   = int(os.environ.get("FOLD", rc.get("fold", 1)))
+    seed:   int   = int(rc.get("seed", 42))
+    device: str   = str(rc.get("device", "cpu"))
+    lr:     float = float(rc.get("lr_bottom", 1e-3))
+    out_dim: int  = int(rc.get("out_feature_dim", 16))  # 16 per silo → 32 concat, matches decoupled
+
+    set_seed(seed)
+    dev = torch.device(device)
+
+    X1, X2, _y, folds_data = load_npz(npz)
+    split_obj = folds_data[fold - 1]
+    split     = split_obj.item() if hasattr(split_obj, "item") else split_obj
+    tr        = split["train"].astype(np.int64)
+
+    def _std(X: np.ndarray) -> np.ndarray:
+        mu = X[tr].mean(axis=0, keepdims=True)
+        sd = X[tr].std(axis=0, keepdims=True) + 1e-8
+        return (X - mu) / sd
+
+    cache["dev"]     = dev
+    cache["out_dim"] = out_dim
+    cache["lr"]      = lr
+    cache["X"] = {
+        0: torch.from_numpy(_std(X1)).float().to(dev),
+        1: torch.from_numpy(_std(X2)).float().to(dev),
+    }
+    cache["in_dim"] = {0: int(X1.shape[1]), 1: int(X2.shape[1])}
+
+    cache["models"]: Dict[int, nn.Module]             = {}
+    cache["opts"]:   Dict[int, torch.optim.Optimizer] = {}
+
+    cache["ready"] = True
+    print(f"[Client init] node={_cache_key(context)} fold={fold} "
+          f"device={device} X1dim={X1.shape[1]} X2dim={X2.shape[1]} out_dim={out_dim}")
+
+
+def _get_model_opt(context: Context, view: int) -> Tuple[nn.Module, torch.optim.Optimizer]:
+    cache   = _get_cache(context)
+    dev     = cache["dev"]
+    out_dim = int(cache["out_dim"])
+    lr      = float(cache["lr"])
+    in_dim  = cache["in_dim"][view]
+
+    if view not in cache["models"]:
+        model = BottomMLP(in_dim=in_dim, out_dim=out_dim).to(dev)
+        opt   = torch.optim.Adam(model.parameters(), lr=lr)
+        cache["models"][view] = model
+        cache["opts"][view]   = opt
+    return cache["models"][view], cache["opts"][view]
+
+
+app = ClientApp()
+
+
+@app.query("generate_embeddings")
+def generate_embeddings(msg: Message, context: Context) -> Message:
+    """FIX-A/B: Always eval + no_grad. Gradients computed in apply_gradients."""
+    _init_if_needed(context)
+    cache = _get_cache(context)
+
+    view      = int(msg.content["config"].get("view", 0))
+    X: torch.Tensor = cache["X"][view]
+    batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
+    idx_t     = torch.from_numpy(batch_idx).long().to(X.device)
+    model, _  = _get_model_opt(context, view)
+
+    model.eval()
+    with torch.no_grad():
+        emb_np = model(X.index_select(0, idx_t)).detach().cpu().numpy().astype(np.float32)
+
+    return Message(
+        content=RecordDict({"arrays": ArrayRecord({"embedding": Array(emb_np)})}),
+        reply_to=msg,
+    )
+
+
+@app.train("apply_gradients")
+def apply_gradients(msg: Message, context: Context) -> Message:
+    """FIX-A: Fresh forward pass here, same as DIA. No cross-message cache."""
+    _init_if_needed(context)
+    cache = _get_cache(context)
+
+    view      = int(msg.content["config"].get("view", 0))
+    X: torch.Tensor = cache["X"][view]
+    batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
+    grad_np   = msg.content["arrays"]["local_gradients"].numpy().astype(np.float32)
+
+    idx_t  = torch.from_numpy(batch_idx).long().to(X.device)
+    grad_t = torch.from_numpy(grad_np).float().to(cache["dev"])
+
+    model, opt = _get_model_opt(context, view)
+    model.train()
+    opt.zero_grad(set_to_none=True)
+
+    emb = model(X.index_select(0, idx_t))   # fresh forward — correct
+    emb.backward(grad_t)
+    opt.step()
+
+    return Message(content=RecordDict(), reply_to=msg)
+
+
+@app.query("checkpoint_bottom")
+def checkpoint_bottom(msg: Message, context: Context) -> Message:
+    """DISK-BASED: survives Ray dispatching restore to a different actor than checkpoint."""
+    _init_if_needed(context)
+    cache   = _get_cache(context)
+    rc      = getattr(context, "run_config", {}) or {}
+    out_dir = Path(str(rc.get("out_dir", "runs_splitnn_vfl")))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fold    = int(os.environ.get("FOLD", rc.get("fold", 1)))
+
+    for view, model in cache["models"].items():
+        ckpt_path = out_dir / f"best_bottom_fold{fold}_view{view}.pt"
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"[Client {_cache_key(context)} pid={os.getpid()}] checkpoint saved -> {ckpt_path}")
+    return Message(content=RecordDict(), reply_to=msg)
+
+
+@app.query("restore_best_bottom")
+def restore_best_bottom(msg: Message, context: Context) -> Message:
+    """DISK-BASED: works regardless of which Ray actor receives this message."""
+    _init_if_needed(context)
+    cache   = _get_cache(context)
+    rc      = getattr(context, "run_config", {}) or {}
+    out_dir = Path(str(rc.get("out_dir", "runs_splitnn_vfl")))
+    fold    = int(os.environ.get("FOLD", rc.get("fold", 1)))
+
+    for view, model in cache["models"].items():
+        ckpt_path = out_dir / f"best_bottom_fold{fold}_view{view}.pt"
+        if ckpt_path.exists():
+            model.load_state_dict(torch.load(ckpt_path, map_location=cache["dev"]))
+            print(f"[Client {_cache_key(context)} pid={os.getpid()}] restored from {ckpt_path}")
+        else:
+            print(f"[Client {_cache_key(context)} pid={os.getpid()}] WARNING: {ckpt_path} not found!")
+    return Message(content=RecordDict(), reply_to=msg)
