@@ -223,4 +223,12 @@ To install all dependencies:
 pip install -e .
 ```
 
-> **Note:** CUDA-capable GPU is required for BYOL pre-training and feature extraction. The Tier 2 Flower VFL session (frozen encoders + head training) can run on CPU.
+> **Note on GPU requirements:**
+> - **BYOL pre-training and feature extraction:** GPU required (ResNet50)
+> - **Supervised active pre-training:** GPU required (ResNet50)
+> - **SplitNN (Condition 1) and Centralized (Condition 4):** GPU required — ResNet50 backbones remain fully trainable during training
+> - **Decoupled Tier 2 (Conditions 2, 3):** Can run on CPU — encoders are frozen and only the lightweight fusion head is trained on pre-extracted PCA features
+
+> **Note on dimensionality reduction:**
+> - **Decoupled VFL (Conditions 2, 3):** After pre-training, each frozen ResNet50 backbone extracts 2,048-dimensional features. **PCA** (256 components, fitted on training fold only) reduces these to 256 dimensions. Validation and test splits are transformed using the training-derived PCA projection. This replaces the trainable projection layer entirely.
+> - **SplitNN (Condition 1) and Centralized (Condition 4):** No PCA is used. Instead, a trainable **ProjectionMLP** (2,048 → 512 → 256, with LayerNorm, GELU, and Dropout(0.2)) is trained end-to-end alongside the ResNet50 backbone during the experiment.
