@@ -91,6 +91,7 @@ All conditions use Adam optimizer, BCEWithLogitsLoss with per-fold positive clas
 ### Step 1 — Install dependencies
 
 ```bash
+pip install -r requirements.txt
 pip install -e .
 ```
 
