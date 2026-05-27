@@ -29,7 +29,7 @@ serverapp = "YOUR_SERVER_SCRIPT:app"
 clientapp = "YOUR_CLIENT_SCRIPT:app"
 
 [tool.flwr.app.config]
-# Hyperparameters for Flower-managed experiments (SplitNN and HFL pre-training)
+# Hyperparameters for Flower-managed experiments (SplitNN, Decoupled VFL Tier 2, and HFL pre-training)
 fold       = 1      # Change per fold (1-5)
 rounds     = 100
 batch_size = 64
