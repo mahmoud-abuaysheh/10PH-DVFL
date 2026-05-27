@@ -111,6 +111,7 @@ cd glioma/   # or diabetes/ or midas/
 ### 3. Install dependencies
 
 ```bash
+pip install -r requirements.txt
 pip install -e .
 ```
 
@@ -187,7 +188,7 @@ If you use this code, please cite:
 @article{10ph-dvfl-2025,
   title     = {10PH-DVFL: A Decoupled Vertical Federated Learning Architecture for Privacy-Preserving Multimodal Personalized Medicine},
   journal   = {Journal of Artificial Intelligence Research},
-  year      = {2026}
+  year      = {2025}
 }
 ```
 
