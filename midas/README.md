@@ -11,7 +11,7 @@ This folder contains the code for the MIDAS (Dermatology) experiment reported in
 The MIDAS dataset is obtained from the Melanoma Research Alliance Multimodal Image Dataset for AI-based Skin Cancer (MRA-MIDAS), provided through Stanford AIMI.
 
 - **Citation:** Chiou, A., et al. (2024). MRA-MIDAS: Multimodal Image Dataset for AI-based Skin Cancer. Center for Artificial Intelligence in Medicine and Imaging. https://doi.org/10.71718/15NZ-JV40
-- **Access:** Request access through Stanford AIMI: https://aimi.stanford.edu/midas
+- **Access:** Download from Stanford AIMI: https://stanfordaimi.azurewebsites.net/datasets/f4c2020f-801a-42dd-a477-a1a8357ef2a5
 - **Cohort:** 660 aligned lesions (1,980 images total) after retaining only lesions with all three modalities present
 - **Task:** Binary classification — Benign (class 0, n=354, 53.6%) vs. Malignant (class 1, n=306, 46.4%)
 - **Three vertical silos:** Dermoscopy (dscope, active), 6-inch photography (6in, passive), 1-foot photography (1ft, passive)
@@ -55,6 +55,8 @@ python rebuild_aligned_canonical_table_validated.py \
 ```
 
 This reads the raw MIDAS Excel metadata file and resolves image paths, producing `aligned_canonical_table_validated.csv` (660 aligned lesion triples).
+
+> **Note on canonical selection:** Each patient may have multiple images per modality. This script selects one canonical image per modality per lesion deterministically by taking the first record after sorting by filename. Only lesions with all three modalities physically present and resolvable on disk are retained.
 
 ### Step 2 — Generate per-fold NPZ files
 
