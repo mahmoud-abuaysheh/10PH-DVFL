@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "10ph-dvfl-glioma"
+version = "1.0.0"
+description = "10PH-DVFL: Glioma Experiment"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "flwr[simulation]==1.26.1",
+  "numpy",
+  "torch",
+  "scikit-learn",
+  "pandas",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.flwr.app]
+publisher = "Mahmoud2231991"
+
+[tool.flwr.app.components]
+# Replace with your experiment server and client scripts.
+# Example: serverapp = "your_server_script:app"
+serverapp = "YOUR_SERVER_SCRIPT:app"
+clientapp = "YOUR_CLIENT_SCRIPT:app"
+
+[tool.flwr.app.config]
+# Core hyperparameters used in the paper — override per experiment as needed.
+fold         = 1     # Change per fold (1-5)
+rounds       = 100
+batch_size   = 256
+seed         = 42
