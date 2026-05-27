@@ -1,0 +1,10 @@
+# Diabetes Experiment — exact versions used in the paper
+# Environment: Ubuntu 22.04.5 LTS via WSL2, Python 3.10, CPU only
+
+flwr[simulation]==1.26.1
+torch==2.5.1
+numpy==2.2.6
+scikit-learn==1.7.2
+pandas==2.3.3
+ray==2.51.1
+scipy==1.15.3
