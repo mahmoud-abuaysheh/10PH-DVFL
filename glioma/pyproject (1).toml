@@ -29,8 +29,9 @@ serverapp = "YOUR_SERVER_SCRIPT:app"
 clientapp = "YOUR_CLIENT_SCRIPT:app"
 
 [tool.flwr.app.config]
-# Core hyperparameters used in the paper — override per experiment as needed.
-fold         = 1     # Change per fold (1-5)
-rounds       = 100
-batch_size   = 256
-seed         = 42
+# Hyperparameters for Flower-managed experiments (SplitNN and HFL pre-training)
+fold       = 1      # Change per fold (1-5)
+rounds     = 100
+batch_size = 64
+lr         = 1e-3
+seed       = 42
