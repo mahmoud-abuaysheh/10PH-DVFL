@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "10ph-dvfl-diabetes"
+version = "1.0.0"
+description = "10PH-DVFL: Diabetes Experiment"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "flwr[simulation]==1.26.1",
+  "numpy",
+  "torch",
+  "scikit-learn",
+  "pandas",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.flwr.app]
+publisher = "Mahmoud2231991"
+
+[tool.flwr.app.components]
+# Replace with your experiment server and client scripts.
+# Example: serverapp = "your_server_script:app"
+serverapp = "YOUR_SERVER_SCRIPT:app"
+clientapp = "YOUR_CLIENT_SCRIPT:app"
+
+[tool.flwr.app.config]
+# Hyperparameters for Flower-managed experiments (SplitNN, Decoupled VFL Tier 2, and HFL pre-training)
+# Note: Decoupled Tier 2 uses batch_size = 2048; all other experiments use batch_size = 256
+fold       = 1      # Change per fold (1-5)
+rounds     = 100
+batch_size = 256
+lr         = 1e-3
+seed       = 42
