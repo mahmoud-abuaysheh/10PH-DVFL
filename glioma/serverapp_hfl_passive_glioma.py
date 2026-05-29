@@ -11,6 +11,13 @@
 # Checkpoint saved as:
 #   pretrained_passive_bottom_hfl_fold{N}.pt
 # (same key name as DIA — VFL client loads via PASSIVE_BOTTOM_CKPT)
+#
+# Step 5 (Option A): after FedAvg, each fog node generates embeddings from its
+# local slice of the aligned cohort using the converged encoder.  The server
+# collects and concatenates them into a silo-level embedding matrix saved as
+#   passive_aligned_embeddings_hfl_fold{N}.npz
+# Pre-computed per-node partitions are read from hfl_partitions["iid"][f"K{K}"]
+# ["silo2"] in the npz, guaranteeing consistency with the training partitions.
 from __future__ import annotations
 
 import csv
@@ -185,7 +192,7 @@ def main(grid: Grid, context: Context) -> None:
             round_comm = 0
 
             for node_idx, nid in enumerate(node_ids):
-                # Send global weights → client
+                # Send global weights to client
                 send_bytes = model_bytes
                 round_comm += send_bytes
 
@@ -301,3 +308,75 @@ def main(grid: Grid, context: Context) -> None:
 
     log(INFO, "[HFL-DONE] fold=%d total_comm=%.4f MB checkpoint=%s",
         fold, total_comm_bytes / 1024**2, ckpt_path)
+
+    # ── Step 5: Option A — collect embeddings from fog nodes ──────────────────
+    # Each fog node applies the converged encoder to its local slice of the
+    # aligned cohort and returns embeddings. Raw data never leaves the fog node.
+    # The server concatenates per-node embeddings into a single silo-level
+    # embedding matrix and saves it alongside the checkpoint.
+    #
+    # Per-node index partitions are read directly from hfl_partitions["iid"]
+    # [f"K{K}"]["silo2"] in the npz, guaranteeing consistency with the
+    # partitions used during FedAvg training.
+    log(INFO, "[HFL] Step 5: collecting aligned-cohort embeddings from fog nodes...")
+
+    d_npz   = np.load(npz_path, allow_pickle=True)
+    folds_  = list(d_npz["folds"])
+    split_o = folds_[fold - 1]
+    split_  = split_o.item() if hasattr(split_o, "item") else split_o
+    hp      = split_["hfl_partitions"]
+    hp      = hp.item() if hasattr(hp, "item") else hp
+    k_key   = f"K{K}"
+    if k_key not in hp["iid"]:
+        raise ValueError(
+            f"hfl_partitions has no iid/{k_key}. "
+            f"Available keys: {list(hp['iid'].keys())}"
+        )
+    # silo2 = passive silo (X2); list of K arrays, one per fog node
+    al_parts = hp["iid"][k_key]["silo2"]
+
+    node_embeddings  = {}   # node_idx -> np.ndarray (n_local_aligned, emb_dim)
+    node_aligned_idx = {}   # node_idx -> aligned indices in original X2 space
+
+    for node_idx, nid in enumerate(node_ids):
+        local_aligned = np.asarray(al_parts[node_idx]).astype(np.int64)
+        node_aligned_idx[node_idx] = local_aligned
+
+        rep = _grid_request(grid, Message(
+            content=RecordDict({
+                "arrays": ArrayRecord({
+                    **{f"bottom_{k}": Array(
+                        v.numpy().astype(np.float32)
+                        if isinstance(v, torch.Tensor)
+                        else np.asarray(v).astype(np.float32))
+                       for k, v in bottom_state.items()},
+                    # Send indices as int32 to avoid float32 precision loss
+                    "aligned_idx": Array(local_aligned.astype(np.int32)),
+                }),
+                "config": ConfigRecord({"fold": fold}),
+            }),
+            dst_node_id=nid,
+            message_type="query.get_embeddings",
+        ))
+
+        embs = np.asarray(rep.content["arrays"]["embeddings"].numpy()).astype(np.float32)
+        node_embeddings[node_idx] = embs
+        log(INFO, "[HFL] node_idx=%d n_aligned=%d emb_shape=%s",
+            node_idx, len(local_aligned), embs.shape)
+
+    # Reconstruct full aligned embedding matrix in original index order
+    all_idx  = np.concatenate([node_aligned_idx[i] for i in range(K)])
+    all_embs = np.concatenate([node_embeddings[i]  for i in range(K)], axis=0)
+    sort_ord = np.argsort(all_idx)
+    aligned_embeddings = all_embs[sort_ord]   # shape: (n_aligned, emb_dim)
+    aligned_indices    = all_idx[sort_ord]    # original X2 row indices
+
+    emb_path = run_dir / f"passive_aligned_embeddings_hfl_fold{fold}.npz"
+    np.savez(emb_path,
+             embeddings=aligned_embeddings,
+             aligned_indices=aligned_indices,
+             x2_mu=mu, x2_sd=sd,
+             fold=np.array(fold))
+
+    log(INFO, "[HFL] Aligned embeddings saved: shape=%s  path=%s",
+        aligned_embeddings.shape, emb_path)
