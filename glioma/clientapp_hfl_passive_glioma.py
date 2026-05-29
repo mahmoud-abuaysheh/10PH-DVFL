@@ -133,6 +133,52 @@ def get_stats(msg: Message, ctx: Context) -> Message:
     })}), reply_to=msg)
 
 
+@app.query("get_embeddings")
+def get_embeddings(msg: Message, ctx: Context) -> Message:
+    """Option A: apply the converged encoder to this node's aligned cohort slice
+    and return the embeddings.  Raw data never leaves the fog node."""
+    _init_if_needed(ctx)
+    st     = _st(ctx)
+    dev    = st["dev"]
+    in_dim = st["in_dim"]
+
+    # Receive the final converged bottom encoder weights from the server
+    arrs         = msg.content["arrays"]
+    bottom_state = {k[len("bottom_"):]: _to_f32_tensor(arrs[k], dev)
+                    for k in arrs if k.startswith("bottom_")}
+
+    bottom = BottomMLP(in_dim=in_dim, out_dim=16).to(dev)
+    bottom.load_state_dict(bottom_state, strict=True)
+    bottom.eval()
+
+    # Determine which indices belong to the aligned cohort for this node.
+    # The server sends the aligned indices relevant to this node via config.
+    cfg = msg.content["config"]
+    aligned_idx_key = "aligned_idx"
+    if aligned_idx_key in arrs:
+        aligned_idx = np.asarray(arrs[aligned_idx_key].numpy()).astype(np.int32).astype(np.int64)
+    else:
+        # Fallback: use all available data indices if no specific aligned idx sent
+        aligned_idx = np.arange(st["X2"].shape[0], dtype=np.int64)
+
+    X2  = st["X2"]
+    idx_t = torch.from_numpy(aligned_idx).long().to(dev)
+
+    with torch.no_grad():
+        xb   = X2.index_select(0, idx_t)
+        embs = bottom(xb).cpu().numpy().astype(np.float32)
+
+    return Message(content=RecordDict({
+        "arrays": ArrayRecord({
+            "embeddings": Array(embs),
+        }),
+        "config": ConfigRecord({
+            "n_aligned": len(aligned_idx),
+            "emb_dim":   embs.shape[1],
+        }),
+    }), reply_to=msg)
+
+
 @app.train("local_train")
 def local_train(msg: Message, ctx: Context) -> Message:
     _init_if_needed(ctx)
