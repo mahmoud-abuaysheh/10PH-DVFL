@@ -1,4 +1,6 @@
 # clientapp_vfl_diabetes_decoupled.py
+# Flower client for the decoupled VFL diabetes experiment.
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -35,7 +37,7 @@ def set_seed(seed: int) -> None:
 
 
 class BottomMLP_Paper(nn.Module):
-    """Baseline bottom: in_dim -> 16 -> 8 with ReLU."""
+    """Bottom encoder used by each silo: input features -> 16 -> 8 with ReLU activations."""
     def __init__(self, in_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -98,7 +100,7 @@ def _arrays_to_state_dict(arrs: Dict[str, Array], device: torch.device) -> Dict[
     return {k: torch.from_numpy(arr.numpy()).to(device) for k, arr in arrs.items()}
 
 def _two_view_augment(x: torch.Tensor, noise_std: float = 0.05, dropout_p: float = 0.1) -> tuple[torch.Tensor, torch.Tensor]:
-    # tabular augmentation: gaussian noise + feature dropout
+    # Create two augmented tabular views using Gaussian noise and feature dropout.
     def aug(t: torch.Tensor) -> torch.Tensor:
         if noise_std > 0:
             t = t + noise_std * torch.randn_like(t)
@@ -116,9 +118,11 @@ def _neg_cos_sim(z1: torch.Tensor, z2: torch.Tensor, eps: float = 1e-8) -> torch
 
 def _init_if_needed(context: Context, desired_role: str) -> None:
     """
-    desired_role is provided by server per-request:
-      - "active": must load active bottom into m0 (X1)
-      - "passive": must load passive bottom into m1 (X2)
+    Initialize the client for the role requested by the server.
+
+    The active role loads the active-silo encoder for X1. The passive role loads
+    the passive-silo encoder for X2. The passive_hfl role initializes the passive
+    encoder for local HFL pre-training.
     """
     cache = _get_cache(context)
     key = f"ready::{desired_role}"
@@ -134,14 +138,13 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
     seed = int(run.get("seed", 42))
     device = str(run.get("device", "cpu"))
 
-    # Use dirs from run-config (this matches what you pass)
+    # Read checkpoint directories from the Flower run configuration.
     active_dir = str(run.get("active_ckpt_dir", "./runs_active_ssl_diabetes"))
     passive_dir = str(run.get("passive_ckpt_dir", "./runs_passive_ssl_diabetes"))
 
     active_ckpt = os.path.join(active_dir, f"pretrained_active_bottom_ssl_fold{fold}.pt")
-    # passive could be local SSL or HFL, but we standardize filename for both:
-    # - local SSL script saves: pretrained_passive_bottom_ssl_fold{fold}.pt
-    # - HFL script saves: pretrained_passive_bottom_hfl_fold{fold}.pt
+    # The passive checkpoint may come from either local SSL or HFL pre-training.
+    # Both checkpoint names are checked so the same client can support both experiment variants.
     passive_ckpt_local = os.path.join(passive_dir, f"pretrained_passive_bottom_ssl_fold{fold}.pt")
     passive_ckpt_hfl = os.path.join(passive_dir, f"pretrained_passive_bottom_hfl_fold{fold}.pt")
 
@@ -173,7 +176,7 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
         sd = _unwrap_state_dict(state)
         m0.load_state_dict(sd, strict=True)
         cache["model_for_view0"] = m0
-        cache["model_for_view1"] = m1  # unused
+        cache["model_for_view1"] = m1  # Not used by the active role.
         print(f"[Client init][ACTIVE] loaded {active_ckpt}")
 
     elif desired_role == "passive":
@@ -185,15 +188,15 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
         state = torch.load(ckpt_path, map_location=dev)
         sd = _unwrap_state_dict(state)
         m1.load_state_dict(sd, strict=True)
-        cache["model_for_view0"] = m0  # unused
+        cache["model_for_view0"] = m0  # Not used by the passive role.
         cache["model_for_view1"] = m1
         print(f"[Client init][PASSIVE] loaded {ckpt_path}")
 
     elif desired_role == "passive_hfl":
-        # start from random init; training happens via hfl_fit query
-        cache["model_for_view0"] = m0  # unused
-        cache["model_for_view1"] = m1  # trainable
-        # keep requires_grad True for view1 model (passive)
+        # Start from a randomly initialized passive encoder; training is performed through hfl_fit.
+        cache["model_for_view0"] = m0  # Not used by the passive HFL role.
+        cache["model_for_view1"] = m1  # Trainable passive encoder.
+        # Keep the passive encoder trainable during HFL pre-training.
         for p in cache["model_for_view1"].parameters():
             p.requires_grad_(True)
         cache["model_for_view1"].train()
@@ -220,7 +223,7 @@ def generate_embeddings(msg: Message, context: Context) -> Message:
     _init_if_needed(context, desired_role)
     cache = _get_cache(context)
 
-    view = int(msg.content["config"].get("view", 0))  # 0->X1(active), 1->X2(passive)
+    view = int(msg.content["config"].get("view", 0))  # View 0 uses X1 from the active silo; view 1 uses X2 from the passive silo.
     X = cache["X1"] if view == 0 else cache["X2"]
 
     batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
@@ -257,14 +260,11 @@ def get_labels(msg: Message, context: Context) -> Message:
 
 @app.query("hfl_fit")
 def hfl_fit(msg: Message, context: Context) -> Message:
-    """Passive-only HFL SSL pretraining (FedAvg) for K clients.
+    """Run one local HFL update for passive-silo self-supervised pre-training.
 
-    Server sends:
-      - config: role="passive_hfl", client_rank, K, lr, local_epochs, batch, noise_std, dropout_p
-      - arrays: global_weights (state_dict tensors as arrays)
-    Client returns:
-      - arrays: updated_weights
-      - config: num_examples, loss
+    The server sends the current global passive encoder weights and the client
+    trains on its assigned partition using two augmented tabular views. The client
+    returns updated weights, the number of local examples, and the average loss.
     """
     cfg = msg.content["config"]
     desired_role = str(cfg.get("role", "")).strip().lower()
@@ -275,15 +275,14 @@ def hfl_fit(msg: Message, context: Context) -> Message:
     cache = _get_cache(context)
     dev: torch.device = cache["dev"]
 
-    # identify this client's local partition
+    # Select this HFL client's local training partition.
     client_rank = int(cfg.get("client_rank", 0))
     K = int(cfg.get("K", 1))
     X2: torch.Tensor = cache["X2"]
     fold = int(os.environ.get("FOLD", context.run_config.get("fold", 1)))
 
-    # recover train indices from folds (already loaded during init)
-    # we stored standardized full X2; now we need fold->train indices again
-    # easiest: reload from cache meta? we can recompute by reloading npz once
+    # Recover the fold-specific training indices used to create the HFL partitions.
+    # The standardized X2 matrix is already cached, but the original fold metadata is reloaded here.
     run = context.run_config
     DEFAULT_NPZ = Path(__file__).resolve().parent / "diabetes_vfl_cv.npz"
     npz = str(run.get("npz", str(DEFAULT_NPZ)))
@@ -300,7 +299,7 @@ def hfl_fit(msg: Message, context: Context) -> Message:
     model: nn.Module = cache["model_for_view1"]
     model.to(dev)
 
-    # load global weights if provided
+    # Load the current global encoder weights when they are provided by the server.
     if "arrays" in msg.content and "global_weights" in msg.content["arrays"]:
         gw = msg.content["arrays"]["global_weights"]
         sd = _arrays_to_state_dict(gw, dev)
@@ -314,11 +313,11 @@ def hfl_fit(msg: Message, context: Context) -> Message:
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    # train: cosine agreement between two augmented views (no labels)
+    # Train the passive encoder without labels by matching two augmented views of the same samples.
     n = len(local_idx)
     model.train()
     losses = []
-    # shuffle each epoch
+    # Shuffle the local partition at the beginning of each local epoch.
     for _ in range(local_epochs):
         perm = np.random.permutation(n)
         for start in range(0, n, batch):
@@ -335,7 +334,7 @@ def hfl_fit(msg: Message, context: Context) -> Message:
 
     avg_loss = float(np.mean(losses)) if losses else 0.0
 
-    # return updated weights
+    # Return the locally updated encoder weights to the server for aggregation.
     out_sd = model.state_dict()
     out_arrs = ArrayRecord({"global_weights": _state_dict_to_arrays(out_sd)})
     out_cfg = _cfg({"num_examples": int(n), "loss": avg_loss, "client_rank": client_rank, "K": K})
