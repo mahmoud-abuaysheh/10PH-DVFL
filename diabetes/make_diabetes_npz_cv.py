@@ -1,3 +1,8 @@
+# make_diabetes_vfl_cv_npz.py
+# Prepare the diabetes dataset for VFL experiments.
+# The script removes duplicate records, creates stable sample IDs, encodes categorical variables,
+# splits features into active and passive views, and saves stratified cross-validation folds.
+
 import argparse, os, json
 import numpy as np
 import pandas as pd
@@ -15,27 +20,27 @@ def main():
     df = pd.read_csv(args.csv)
     n0 = len(df)
 
-    # remove duplicates
+    # Remove duplicate rows before creating the VFL dataset.
     df = df.drop_duplicates().reset_index(drop=True)
     n1 = len(df)
     print(f"[INFO] rows: {n0} -> {n1} after drop_duplicates (removed {n0-n1})")
 
-    # stable ids (used for alignment)
+    # Create stable sample identifiers for alignment between the active and passive views.
     df["ids"] = np.arange(len(df)).astype(str)
 
-    # label
+    # Load the binary diabetes label.
     if "diabetes" not in df.columns:
         raise ValueError("Expected column 'diabetes' in CSV")
     y = df["diabetes"].astype(int).to_numpy()
 
-    # one-hot categorical
+    # One-hot encode categorical variables.
     cat_cols = ["gender", "smoking_history"]
     for c in cat_cols:
         if c not in df.columns:
             raise ValueError(f"Expected column '{c}' in CSV")
     df_cat = pd.get_dummies(df[cat_cols].astype(str), prefix=cat_cols)
 
-    # numeric
+    # Select numeric clinical and demographic variables.
     num_cols = ["age", "hypertension", "heart_disease", "bmi", "HbA1c_level", "blood_glucose_level"]
     for c in num_cols:
         if c not in df.columns:
@@ -44,7 +49,7 @@ def main():
 
     feats_all = pd.concat([df_num, df_cat], axis=1)
 
-    # vertical split: client X (active) + client Y (passive)
+    # Split the feature space vertically into active-silo and passive-silo views.
     x1_cols = ["age", "hypertension", "heart_disease"] + [c for c in feats_all.columns if c.startswith("gender_")]
     x2_cols = ["bmi", "HbA1c_level", "blood_glucose_level"] + [c for c in feats_all.columns if c.startswith("smoking_history_")]
 
@@ -52,7 +57,7 @@ def main():
     X2 = feats_all[x2_cols].to_numpy(dtype=np.float32)
     ids = df["ids"].to_numpy()
 
-    # 5-fold outer CV + stratified val split inside train
+    # Create stratified outer folds, with a stratified validation split inside each training fold.
     skf = StratifiedKFold(n_splits=args.outer_folds, shuffle=True, random_state=args.seed)
     folds = []
 
@@ -80,6 +85,7 @@ def main():
         "val_frac": float(args.val_frac),
     }
 
+    # Save features, labels, sample IDs, fold indices, and metadata for the VFL experiments.
     np.savez(
         args.out_npz,
         X1=X1,
