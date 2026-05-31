@@ -1,4 +1,8 @@
 # clientapp_vfl_diabetes_splitnn.py
+# Flower client for the SplitNN-based VFL diabetes experiment.
+# Each client owns one feature view and updates its bottom model using gradients
+# received from the server-side top model.
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -34,7 +38,7 @@ def set_seed(seed: int) -> None:
 
 
 class BottomMLP_Paper(nn.Module):
-    """Bottom model: in_dim -> 16 -> 8 with Linear+ReLU."""
+    """Bottom encoder used by each silo: input features -> 16 -> 8 with ReLU activations."""
     def __init__(self, in_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -94,7 +98,7 @@ def _init_if_needed(context: Context) -> None:
     cache["X2"] = torch.from_numpy(X2s).float().to(dev)
     cache["y"] = torch.from_numpy(y).long().to(dev)
 
-    cache["models"] = {}  # keyed by view 0/1
+    cache["models"] = {}  # Bottom models are created separately for each feature view.
     cache["opts"] = {}
 
     cache["ready"] = True
@@ -123,7 +127,7 @@ def generate_embeddings(msg: Message, context: Context) -> Message:
     cache = _get_cache(context)
 
     cfg = msg.content.get("config", None)
-    view = int(cfg.get("view", 0) if cfg is not None else 0)  # 0->X1, 1->X2
+    view = int(cfg.get("view", 0) if cfg is not None else 0)  # View 0 uses X1; view 1 uses X2.
     X = cache["X1"] if view == 0 else cache["X2"]
 
     batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
@@ -140,7 +144,7 @@ def generate_embeddings(msg: Message, context: Context) -> Message:
 
 @app.query("get_labels")
 def get_labels(msg: Message, context: Context) -> Message:
-    """Server calls this ONLY on the ACTIVE node."""
+    """Return labels from the active silo for the requested batch."""
     _init_if_needed(context)
     cache = _get_cache(context)
     y = cache["y"]
@@ -181,7 +185,7 @@ def apply_gradients(msg: Message, context: Context) -> Message:
     return Message(content=RecordDict(), reply_to=msg)
 
 
-# ✅ Alias so server can call train.backward
+# Expose the same gradient-update step under the name expected by the server.
 @app.train("backward")
 def backward(msg: Message, context: Context) -> Message:
     return apply_gradients(msg, context)
@@ -189,7 +193,7 @@ def backward(msg: Message, context: Context) -> Message:
 
 @app.query("checkpoint_bottom")
 def checkpoint_bottom(msg: Message, context: Context) -> Message:
-    """Save current bottom model weights to disk (called by server at best val round)."""
+    """Save the current bottom-model weights for the selected view."""
     _init_if_needed(context)
     cache = _get_cache(context)
 
@@ -211,7 +215,7 @@ def checkpoint_bottom(msg: Message, context: Context) -> Message:
 
 @app.query("restore_best_bottom")
 def restore_best_bottom(msg: Message, context: Context) -> Message:
-    """Restore bottom model weights from best checkpoint (called by server at end)."""
+    """Restore the bottom-model weights from the saved best checkpoint."""
     _init_if_needed(context)
     cache = _get_cache(context)
 
