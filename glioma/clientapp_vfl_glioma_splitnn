@@ -1,19 +1,39 @@
-# clientapp_vfl_glioma_splitnn.py  — matches DIA SplitNN pattern exactly
+# clientapp_vfl_glioma_splitnn.py
 #
-# Key fixes vs previous glioma client:
-#   FIX-A: No embedding cache across messages. apply_gradients does a fresh
-#           forward pass (same as DIA). This is correct because model weights
-#           haven't changed between generate_embeddings and apply_gradients
-#           within the same step, and Ray may dispatch them to different actors.
-#   FIX-B: generate_embeddings always runs under no_grad + eval (DIA pattern).
-#           Gradient computation happens in apply_gradients fresh forward.
-#   FIX-D: No checkpoint_bottom / restore_best_bottom needed — server handles
-#           head checkpointing; bottoms are checkpointed here on request.
+# Flower client application for the SplitNN VFL baseline in the glioma
+# decoupled VFL experiment.
+#
+# This client implements the silo-side behaviour for the glioma SplitNN
+# baseline, where each silo owns one feature view and trains its local
+# bottom encoder end-to-end through gradient signals received from the server.
+#
+# Key design decisions:
+#
+# Fresh forward pass in apply_gradients:
+#   The generate_embeddings handler runs under eval and no_grad and does not
+#   retain any computational graph. When the server sends back gradients,
+#   apply_gradients runs a fresh forward pass with gradient tracking to
+#   back-propagate the received gradient slice through the encoder. This is
+#   correct because model weights have not changed between generate_embeddings
+#   and apply_gradients within the same training step, and using a fresh
+#   forward pass avoids cross-message tensor state which would be unreliable
+#   when Ray may dispatch handlers to different worker actors.
+#
+# Disk-based checkpoint management:
+#   checkpoint_bottom and restore_best_bottom use disk storage rather than
+#   in-memory state. This ensures checkpoint correctness even when Ray
+#   dispatches the restore message to a different actor than the one that
+#   saved the checkpoint, which can happen in multi-node or multi-process
+#   simulation environments.
+#
+# Key architectural difference from the diabetes SplitNN client:
+#   - Bottom encoder: input -> 32 -> out_dim (16) instead of input -> 16 -> 8
+#     matching the glioma decoupled encoder architecture for fair comparison.
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import os
@@ -22,29 +42,58 @@ import torch.nn as nn
 from flwr.app import Array, ArrayRecord, ConfigRecord, Context, Message, RecordDict
 from flwr.clientapp import ClientApp
 
+# Module-level cache to persist loaded data and models across handler calls
+# within the same client process, avoiding repeated disk reads.
 _CACHE: Dict[str, Dict] = {}
 
 
+# ---------------------------------------------------------------------------
+# Cache utilities
+# ---------------------------------------------------------------------------
+
 def _cache_key(context: Context) -> str:
+    """Return a unique string key identifying this client node."""
     nid = getattr(context, "node_id", None)
     return str(nid) if nid is not None else str(id(context))
 
 
 def _get_cache(context: Context) -> Dict:
+    """Return the cache dict for this client node, initialising it if needed."""
     key = _cache_key(context)
     if key not in _CACHE:
         _CACHE[key] = {}
     return _CACHE[key]
 
 
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
 def set_seed(seed: int) -> None:
+    """Fix all random seeds for reproducibility across numpy, torch, and CUDA."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
+# ---------------------------------------------------------------------------
+# Model definition
+# ---------------------------------------------------------------------------
+
 class BottomMLP(nn.Module):
-    """Matches decoupled Glioma bottom exactly: in_dim → 32 → out_dim (default 16)."""
+    """
+    Bottom encoder used by each silo in the glioma SplitNN VFL baseline.
+
+    Projects silo-specific input features through two linear layers with
+    ReLU activations to produce a cut-layer output vector.
+    Architecture: input -> 32 -> ReLU -> out_dim (default 16) -> ReLU
+
+    The deeper architecture compared to the diabetes SplitNN (which uses
+    input -> 16 -> 8) matches the glioma decoupled encoder exactly, ensuring
+    a fair architectural comparison between SplitNN and decoupled conditions.
+    In SplitNN, this encoder is updated every training batch through gradient
+    signals received from the server-side fusion head.
+    """
     def __init__(self, in_dim: int, out_dim: int = 16):
         super().__init__()
         self.net = nn.Sequential(
@@ -58,7 +107,16 @@ class BottomMLP(nn.Module):
         return self.net(x)
 
 
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
 def load_npz(npz_path: str):
+    """
+    Load the pre-computed cross-validation dataset from the NPZ file.
+    Returns feature matrices X1 and X2, labels y, and fold splits.
+    X1 contains active-silo features; X2 contains passive-silo features.
+    """
     d     = np.load(npz_path, allow_pickle=True)
     X1    = d["X1"].astype(np.float32)
     X2    = d["X2"].astype(np.float32)
@@ -67,19 +125,36 @@ def load_npz(npz_path: str):
     return X1, X2, y, folds
 
 
+# ---------------------------------------------------------------------------
+# Initialisation
+# ---------------------------------------------------------------------------
+
 def _init_if_needed(context: Context) -> None:
+    """
+    Initialise the client node by loading the dataset and preparing the
+    feature matrices for both silos.
+
+    This function is called at the start of each handler and is a no-op
+    if the client has already been initialised. Both feature matrices X1
+    and X2 are loaded and standardized so that the same client process
+    can serve either the active or passive silo role depending on the
+    view parameter sent by the server.
+
+    Bottom encoder models are created lazily on first use via _get_model_opt
+    to avoid creating unnecessary models for unused feature views.
+    """
     cache = _get_cache(context)
     if cache.get("ready", False):
         return
 
     DEFAULT_NPZ = Path(__file__).resolve().parent / "glioma_aligned_vfl_hfl_cv.npz"
     rc      = getattr(context, "run_config", {}) or {}
-    npz:    str   = str(rc.get("npz", str(DEFAULT_NPZ)))
-    fold:   int   = int(os.environ.get("FOLD", rc.get("fold", 1)))
-    seed:   int   = int(rc.get("seed", 42))
-    device: str   = str(rc.get("device", "cpu"))
-    lr:     float = float(rc.get("lr_bottom", 1e-3))
-    out_dim: int  = int(rc.get("out_feature_dim", 16))  # 16 per silo → 32 concat, matches decoupled
+    npz:     str   = str(rc.get("npz", str(DEFAULT_NPZ)))
+    fold:    int   = int(os.environ.get("FOLD", rc.get("fold", 1)))
+    seed:    int   = int(rc.get("seed", 42))
+    device:  str   = str(rc.get("device", "cpu"))
+    lr:      float = float(rc.get("lr_bottom", 1e-3))
+    out_dim: int   = int(rc.get("out_feature_dim", 16))
 
     set_seed(seed)
     dev = torch.device(device)
@@ -90,6 +165,7 @@ def _init_if_needed(context: Context) -> None:
     tr        = split["train"].astype(np.int64)
 
     def _std(X: np.ndarray) -> np.ndarray:
+        """Standardize using training split statistics only."""
         mu = X[tr].mean(axis=0, keepdims=True)
         sd = X[tr].std(axis=0, keepdims=True) + 1e-8
         return (X - mu) / sd
@@ -97,21 +173,29 @@ def _init_if_needed(context: Context) -> None:
     cache["dev"]     = dev
     cache["out_dim"] = out_dim
     cache["lr"]      = lr
-    cache["X"] = {
+    cache["X"]       = {
         0: torch.from_numpy(_std(X1)).float().to(dev),
         1: torch.from_numpy(_std(X2)).float().to(dev),
     }
-    cache["in_dim"] = {0: int(X1.shape[1]), 1: int(X2.shape[1])}
+    cache["in_dim"]  = {0: int(X1.shape[1]), 1: int(X2.shape[1])}
+    cache["models"]  = {}
+    cache["opts"]    = {}
+    cache["ready"]   = True
 
-    cache["models"]: Dict[int, nn.Module]             = {}
-    cache["opts"]:   Dict[int, torch.optim.Optimizer] = {}
-
-    cache["ready"] = True
-    print(f"[Client init] node={_cache_key(context)} fold={fold} "
-          f"device={device} X1dim={X1.shape[1]} X2dim={X2.shape[1]} out_dim={out_dim}")
+    print(
+        f"[Client init] node={_cache_key(context)} fold={fold} "
+        f"device={device} X1dim={X1.shape[1]} X2dim={X2.shape[1]} out_dim={out_dim}"
+    )
 
 
-def _get_model_opt(context: Context, view: int) -> Tuple[nn.Module, torch.optim.Optimizer]:
+def _get_model_opt(
+    context: Context, view: int
+) -> Tuple[nn.Module, torch.optim.Optimizer]:
+    """
+    Return the bottom encoder and optimizer for the given feature view,
+    creating them on first use. View 0 corresponds to the active silo (X1)
+    and view 1 to the passive silo (X2).
+    """
     cache   = _get_cache(context)
     dev     = cache["dev"]
     out_dim = int(cache["out_dim"])
@@ -123,20 +207,31 @@ def _get_model_opt(context: Context, view: int) -> Tuple[nn.Module, torch.optim.
         opt   = torch.optim.Adam(model.parameters(), lr=lr)
         cache["models"][view] = model
         cache["opts"][view]   = opt
+
     return cache["models"][view], cache["opts"][view]
 
+
+# ---------------------------------------------------------------------------
+# Flower ClientApp and handlers
+# ---------------------------------------------------------------------------
 
 app = ClientApp()
 
 
 @app.query("generate_embeddings")
 def generate_embeddings(msg: Message, context: Context) -> Message:
-    """FIX-A/B: Always eval + no_grad. Gradients computed in apply_gradients."""
+    """
+    Handle a cut-layer activation request from the server.
+
+    Runs under eval mode and no_grad. No computational graph is retained.
+    Gradient computation for the encoder update happens separately in the
+    apply_gradients handler via a fresh forward pass.
+    """
     _init_if_needed(context)
     cache = _get_cache(context)
 
     view      = int(msg.content["config"].get("view", 0))
-    X: torch.Tensor = cache["X"][view]
+    X         = cache["X"][view]
     batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
     idx_t     = torch.from_numpy(batch_idx).long().to(X.device)
     model, _  = _get_model_opt(context, view)
@@ -153,12 +248,21 @@ def generate_embeddings(msg: Message, context: Context) -> Message:
 
 @app.train("apply_gradients")
 def apply_gradients(msg: Message, context: Context) -> Message:
-    """FIX-A: Fresh forward pass here, same as DIA. No cross-message cache."""
+    """
+    Apply the gradient slice received from the server to update the local
+    bottom encoder.
+
+    Runs a fresh forward pass with gradient tracking enabled so that the
+    received gradient can be back-propagated through the encoder. Model
+    weights are unchanged since generate_embeddings ran in the same step,
+    so the fresh forward pass produces identical activations and a correct
+    gradient estimate.
+    """
     _init_if_needed(context)
     cache = _get_cache(context)
 
     view      = int(msg.content["config"].get("view", 0))
-    X: torch.Tensor = cache["X"][view]
+    X         = cache["X"][view]
     batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
     grad_np   = msg.content["arrays"]["local_gradients"].numpy().astype(np.float32)
 
@@ -169,7 +273,8 @@ def apply_gradients(msg: Message, context: Context) -> Message:
     model.train()
     opt.zero_grad(set_to_none=True)
 
-    emb = model(X.index_select(0, idx_t))   # fresh forward — correct
+    # Fresh forward pass with gradient tracking for back-propagation.
+    emb = model(X.index_select(0, idx_t))
     emb.backward(grad_t)
     opt.step()
 
@@ -178,35 +283,59 @@ def apply_gradients(msg: Message, context: Context) -> Message:
 
 @app.query("checkpoint_bottom")
 def checkpoint_bottom(msg: Message, context: Context) -> Message:
-    """DISK-BASED: survives Ray dispatching restore to a different actor than checkpoint."""
+    """
+    Save the current bottom encoder weights for all views to disk.
+
+    Disk-based storage ensures checkpoint correctness regardless of which
+    Ray actor receives the subsequent restore message, which may differ from
+    the actor that saved the checkpoint in distributed simulation environments.
+    Called by the server whenever a new best validation AUROC is achieved.
+    """
     _init_if_needed(context)
     cache   = _get_cache(context)
     rc      = getattr(context, "run_config", {}) or {}
-    out_dir = Path(str(rc.get("out_dir", "runs_splitnn_vfl")))
+    out_dir = Path(str(rc.get("out_dir", "runs_splitnn_vfl_glioma")))
     out_dir.mkdir(parents=True, exist_ok=True)
     fold    = int(os.environ.get("FOLD", rc.get("fold", 1)))
 
     for view, model in cache["models"].items():
         ckpt_path = out_dir / f"best_bottom_fold{fold}_view{view}.pt"
         torch.save(model.state_dict(), ckpt_path)
-        print(f"[Client {_cache_key(context)} pid={os.getpid()}] checkpoint saved -> {ckpt_path}")
+        print(
+            f"[Client {_cache_key(context)} pid={os.getpid()}] "
+            f"checkpoint saved -> {ckpt_path}"
+        )
     return Message(content=RecordDict(), reply_to=msg)
 
 
 @app.query("restore_best_bottom")
 def restore_best_bottom(msg: Message, context: Context) -> Message:
-    """DISK-BASED: works regardless of which Ray actor receives this message."""
+    """
+    Restore the bottom encoder weights from the saved best checkpoint.
+
+    Disk-based restore works regardless of which Ray actor receives this
+    message. Called by the server after training before final test evaluation
+    to ensure the best encoder state is used.
+    """
     _init_if_needed(context)
     cache   = _get_cache(context)
     rc      = getattr(context, "run_config", {}) or {}
-    out_dir = Path(str(rc.get("out_dir", "runs_splitnn_vfl")))
+    out_dir = Path(str(rc.get("out_dir", "runs_splitnn_vfl_glioma")))
     fold    = int(os.environ.get("FOLD", rc.get("fold", 1)))
 
     for view, model in cache["models"].items():
         ckpt_path = out_dir / f"best_bottom_fold{fold}_view{view}.pt"
         if ckpt_path.exists():
-            model.load_state_dict(torch.load(ckpt_path, map_location=cache["dev"]))
-            print(f"[Client {_cache_key(context)} pid={os.getpid()}] restored from {ckpt_path}")
+            model.load_state_dict(
+                torch.load(ckpt_path, map_location=cache["dev"])
+            )
+            print(
+                f"[Client {_cache_key(context)} pid={os.getpid()}] "
+                f"restored from {ckpt_path}"
+            )
         else:
-            print(f"[Client {_cache_key(context)} pid={os.getpid()}] WARNING: {ckpt_path} not found!")
+            print(
+                f"[Client {_cache_key(context)} pid={os.getpid()}] "
+                f"WARNING: {ckpt_path} not found — weights unchanged"
+            )
     return Message(content=RecordDict(), reply_to=msg)
