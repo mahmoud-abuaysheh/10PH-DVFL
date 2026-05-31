@@ -1,13 +1,28 @@
-# train_centralized_diabetes_paper.py
-# Centralized baseline for Diabetes (tabular) aligned with PPVFL-SplitNN paper:
-# - MLP: 16 -> 8 -> 1 (Linear-ReLU, Linear-ReLU, Linear)
-# - BCEWithLogitsLoss
-# - Standardize using TRAIN only
-# - pos_weight computed from TRAIN only
-# - Early stopping on VAL AUROC
-# - Save BEST checkpoint by VAL AUROC + save LAST
-# - Save per-fold curves + per-fold history CSV + overall summary CSV
-# - ALSO: threshold metrics (threshold chosen on VAL only; reported on TEST)
+# train_centralized_diabetes.py
+#
+# Centralized upper-bound baseline for the diabetes experiment.
+#
+# This script trains a single MLP on the full concatenated feature space
+# (active silo X1 + passive silo X2) without any federation constraints.
+# It serves as the centralized reference baseline against which the
+# 10PH-DVFL decoupled architecture and SplitNN baseline are compared.
+#
+# Since all features are available at a single location, this baseline
+# represents the performance ceiling that federated approaches aim to
+# approach while preserving data locality.
+#
+# Architecture (matches the two-silo VFL architecture at inference):
+#   Input (15 features) -> 16 -> ReLU -> 8 -> ReLU -> 1
+#   BCEWithLogitsLoss with per-fold positive class weighting.
+#
+# Evaluation protocol:
+#   - Stratified 5-fold cross-validation with fixed seed=42
+#   - Standardization using training split statistics only
+#   - Early stopping based on validation AUROC
+#   - Classification threshold selected on validation set using max F1
+#   - Primary metrics: AUROC and PR-AUC (reported in the paper)
+#   - Secondary metrics: accuracy, balanced accuracy, precision, recall,
+#     specificity, and F1 (computed at both Youden and max-F1 thresholds)
 
 import argparse
 import csv
@@ -29,7 +44,12 @@ from sklearn.metrics import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
 def set_seed(seed: int) -> None:
+    """Fix all random seeds for reproducibility across numpy, torch, and CUDA."""
     import random
     random.seed(seed)
     np.random.seed(seed)
@@ -39,11 +59,21 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+# ---------------------------------------------------------------------------
+# Model definition
+# ---------------------------------------------------------------------------
+
 class CentralMLP_Paper(nn.Module):
     """
-    Paper-style architecture for Diabetes/Breast Cancer:
-    FC units: 16, 8, 1 with Linear-ReLU activations.
-    (Paper uses Linear-Sigmoid at output; we use logits + BCEWithLogitsLoss.)
+    Centralized MLP baseline for the diabetes experiment.
+
+    Trained on the full concatenated feature space (X1 + X2) to provide
+    the performance upper bound for the federated experiments. The
+    architecture matches the combined VFL architecture at inference time:
+    input features -> 16 -> ReLU -> dropout -> 8 -> ReLU -> 1 (logit).
+
+    BCEWithLogitsLoss is used with per-fold positive class weighting to
+    handle the class imbalance in the diabetes dataset.
     """
     def __init__(self, in_dim: int, dropout: float = 0.0):
         super().__init__()
@@ -60,17 +90,36 @@ class CentralMLP_Paper(nn.Module):
         return self.net(x).squeeze(1)
 
 
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
 def load_npz(npz_path: str):
+    """
+    Load the pre-computed cross-validation dataset from the NPZ file.
+    Concatenates active-silo features X1 and passive-silo features X2
+    into a single full feature matrix for centralized training.
+    Returns the full feature matrix, labels, fold splits, and metadata.
+    """
     d = np.load(npz_path, allow_pickle=True)
-    X = np.concatenate([d["X1"].astype(np.float32), d["X2"].astype(np.float32)], axis=1)
+    X = np.concatenate(
+        [d["X1"].astype(np.float32), d["X2"].astype(np.float32)], axis=1
+    )
     y = d["y"].astype(np.int64)
-    folds = list(d["folds"])  # each element is already a dict in your file
+    folds = list(d["folds"])
     meta = json.loads(str(d["meta"])) if "meta" in d.files else {}
     return X, y, folds, meta
 
 
+# ---------------------------------------------------------------------------
+# Evaluation utilities
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
-def predict_proba(model: nn.Module, X: np.ndarray, device: torch.device) -> np.ndarray:
+def predict_proba(
+    model: nn.Module, X: np.ndarray, device: torch.device
+) -> np.ndarray:
+    """Compute predicted probabilities for a feature matrix."""
     model.eval()
     xb = torch.from_numpy(X).to(device)
     logits = model(xb)
@@ -78,7 +127,13 @@ def predict_proba(model: nn.Module, X: np.ndarray, device: torch.device) -> np.n
 
 
 @torch.no_grad()
-def evaluate_metrics(model: nn.Module, X: np.ndarray, y: np.ndarray, device: torch.device):
+def evaluate_metrics(
+    model: nn.Module, X: np.ndarray, y: np.ndarray, device: torch.device
+) -> tuple:
+    """
+    Compute AUROC and PR-AUC for a feature matrix and label array.
+    These are the primary metrics reported in the paper.
+    """
     probs = predict_proba(model, X, device)
     auroc = roc_auc_score(y, probs)
     prauc = average_precision_score(y, probs)
@@ -86,7 +141,18 @@ def evaluate_metrics(model: nn.Module, X: np.ndarray, y: np.ndarray, device: tor
 
 
 @torch.no_grad()
-def compute_loss(model: nn.Module, X: np.ndarray, y: np.ndarray, criterion, device: torch.device, batch_size: int = 4096):
+def compute_loss(
+    model: nn.Module,
+    X: np.ndarray,
+    y: np.ndarray,
+    criterion,
+    device: torch.device,
+    batch_size: int = 4096,
+) -> float:
+    """
+    Compute the average BCEWithLogitsLoss over a dataset in batches.
+    Used for training history logging without loading the full dataset at once.
+    """
     model.eval()
     n = len(X)
     tot = 0.0
@@ -100,25 +166,36 @@ def compute_loss(model: nn.Module, X: np.ndarray, y: np.ndarray, criterion, devi
 
 
 def get_lr(opt: torch.optim.Optimizer) -> float:
+    """Return the current learning rate from the first parameter group."""
     return float(opt.param_groups[0]["lr"])
 
 
-def _confusion(y_true: np.ndarray, y_pred: np.ndarray):
+# ---------------------------------------------------------------------------
+# Threshold selection and threshold-dependent metrics
+# ---------------------------------------------------------------------------
+
+def _confusion(y_true: np.ndarray, y_pred: np.ndarray) -> tuple:
+    """Extract TP, FP, TN, FN from a confusion matrix."""
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     return int(tp), int(fp), int(tn), int(fn)
 
 
-def threshold_metrics(y_true: np.ndarray, probs: np.ndarray, thr: float):
+def threshold_metrics(
+    y_true: np.ndarray, probs: np.ndarray, thr: float
+) -> dict:
+    """
+    Compute threshold-dependent classification metrics at a fixed threshold.
+    Includes accuracy, balanced accuracy, precision, recall, specificity,
+    F1 score, and raw confusion matrix counts.
+    """
     y_pred = (probs >= thr).astype(np.int64)
     tp, fp, tn, fn = _confusion(y_true, y_pred)
-
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec = recall_score(y_true, y_pred, zero_division=0)  # sensitivity / TPR
-    spec = tn / (tn + fp + 1e-12)  # TNR
-    f1 = f1_score(y_true, y_pred, zero_division=0)
+    acc     = accuracy_score(y_true, y_pred)
+    prec    = precision_score(y_true, y_pred, zero_division=0)
+    rec     = recall_score(y_true, y_pred, zero_division=0)
+    spec    = tn / (tn + fp + 1e-12)
+    f1      = f1_score(y_true, y_pred, zero_division=0)
     bal_acc = 0.5 * (rec + spec)
-
     return {
         "thr": float(thr),
         "acc": float(acc),
@@ -127,15 +204,16 @@ def threshold_metrics(y_true: np.ndarray, probs: np.ndarray, thr: float):
         "specificity": float(spec),
         "f1": float(f1),
         "bal_acc": float(bal_acc),
-        "tp": tp,
-        "fp": fp,
-        "tn": tn,
-        "fn": fn,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
     }
 
 
 def find_best_threshold_youden(y_true: np.ndarray, probs: np.ndarray) -> float:
-    # maximize Youden J = TPR + TNR - 1
+    """
+    Select the threshold that maximises Youden's J statistic (TPR + TNR - 1)
+    on the validation set. Provides a balanced operating point that accounts
+    for both sensitivity and specificity.
+    """
     thresholds = np.unique(probs)
     best_t, best_j = 0.5, -1e18
     for t in thresholds:
@@ -150,6 +228,11 @@ def find_best_threshold_youden(y_true: np.ndarray, probs: np.ndarray) -> float:
 
 
 def find_best_threshold_maxf1(y_true: np.ndarray, probs: np.ndarray) -> float:
+    """
+    Select the threshold that maximises F1 score on the validation set.
+    Used as the primary threshold selection method for consistency with
+    the SplitNN and decoupled VFL scripts.
+    """
     thresholds = np.unique(probs)
     best_t, best_f1 = 0.5, -1e18
     for t in thresholds:
@@ -160,39 +243,50 @@ def find_best_threshold_maxf1(y_true: np.ndarray, probs: np.ndarray) -> float:
     return best_t
 
 
-def _mean_std(vals):
+def _mean_std(vals: list) -> tuple:
+    """Compute mean and standard deviation of a list of values."""
     vals = np.array(vals, dtype=float)
     return float(vals.mean()), float(vals.std())
 
 
+# ---------------------------------------------------------------------------
+# Main training loop
+# ---------------------------------------------------------------------------
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--npz", default="diabetes_vfl_cv.npz")
-    ap.add_argument("--out_dir", default="./ckpts_diabetes_central_paperMLP")
-
-    # training
-    ap.add_argument("--rounds", type=int, default=200)
-    ap.add_argument("--batch", type=int, default=256)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--dropout", type=float, default=0.0)
-
-    # reproducibility / device
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--device", default="cpu")
-
-    # early stop + scheduler
-    ap.add_argument("--patience", type=int, default=15)
-    ap.add_argument("--scheduler", choices=["none", "plateau"], default="plateau")
-    ap.add_argument("--plateau_patience", type=int, default=5)
-    ap.add_argument("--plateau_factor", type=float, default=0.5)
-    ap.add_argument("--min_lr", type=float, default=1e-6)
-
-    # logging loss efficiently
-    ap.add_argument("--loss_eval_batch", type=int, default=4096)
-
-    # thresholding mode (we always compute both youden and maxf1; this just controls printing)
-    ap.add_argument("--print_thresholds", action="store_true")
-
+    ap = argparse.ArgumentParser(
+        description="Centralized upper-bound baseline for the diabetes experiment."
+    )
+    ap.add_argument("--npz", default="diabetes_vfl_cv.npz",
+                    help="Path to diabetes_vfl_cv.npz")
+    ap.add_argument("--out_dir", default="./runs_diabetes_centralized",
+                    help="Directory to write checkpoints and results")
+    ap.add_argument("--rounds", type=int, default=100,
+                    help="Maximum number of training epochs")
+    ap.add_argument("--batch", type=int, default=256,
+                    help="Training batch size")
+    ap.add_argument("--lr", type=float, default=1e-3,
+                    help="Adam learning rate")
+    ap.add_argument("--dropout", type=float, default=0.0,
+                    help="Dropout probability (0.0 disables dropout)")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Random seed for reproducibility")
+    ap.add_argument("--device", default="cpu",
+                    help="Device to use: cpu or cuda")
+    ap.add_argument("--patience", type=int, default=15,
+                    help="Early stopping patience based on validation AUROC")
+    ap.add_argument("--scheduler", choices=["none", "plateau"], default="plateau",
+                    help="Learning rate scheduler type")
+    ap.add_argument("--plateau_patience", type=int, default=5,
+                    help="ReduceLROnPlateau patience")
+    ap.add_argument("--plateau_factor", type=float, default=0.5,
+                    help="ReduceLROnPlateau reduction factor")
+    ap.add_argument("--min_lr", type=float, default=1e-6,
+                    help="Minimum learning rate for ReduceLROnPlateau")
+    ap.add_argument("--loss_eval_batch", type=int, default=4096,
+                    help="Batch size for loss evaluation (does not affect training)")
+    ap.add_argument("--print_thresholds", action="store_true",
+                    help="Print threshold-dependent metrics after each fold")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -211,20 +305,15 @@ def main():
         "best_round", "epochs_used",
         "final_lr",
         "pos_weight_train",
-
-        # thresholds chosen on VAL
         "thr_val_youden", "thr_val_maxf1",
-
-        # TEST metrics @ VAL-Youden
-        "test_acc_youden", "test_prec_youden", "test_rec_youden", "test_spec_youden", "test_f1_youden", "test_balacc_youden",
+        "test_acc_youden", "test_prec_youden", "test_rec_youden",
+        "test_spec_youden", "test_f1_youden", "test_balacc_youden",
         "test_tp_youden", "test_fp_youden", "test_tn_youden", "test_fn_youden",
-
-        # TEST metrics @ VAL-MaxF1
-        "test_acc_maxf1", "test_prec_maxf1", "test_rec_maxf1", "test_spec_maxf1", "test_f1_maxf1", "test_balacc_maxf1",
+        "test_acc_maxf1", "test_prec_maxf1", "test_rec_maxf1",
+        "test_spec_maxf1", "test_f1_maxf1", "test_balacc_maxf1",
         "test_tp_maxf1", "test_fp_maxf1", "test_tn_maxf1", "test_fn_maxf1",
-
-        # TEST metrics @ 0.5
-        "test_acc_05", "test_prec_05", "test_rec_05", "test_spec_05", "test_f1_05", "test_balacc_05",
+        "test_acc_05", "test_prec_05", "test_rec_05",
+        "test_spec_05", "test_f1_05", "test_balacc_05",
         "test_tp_05", "test_fp_05", "test_tn_05", "test_fn_05",
     ]
 
@@ -237,7 +326,8 @@ def main():
         Xva, yva = X[va], y[va]
         Xte, yte = X[te], y[te]
 
-        # ---- standardize using TRAIN only ----
+        # Standardize features using training split statistics only to prevent
+        # any leakage from validation or test sets into the training stage.
         mu = Xtr.mean(0, keepdims=True)
         sd = Xtr.std(0, keepdims=True) + 1e-6
         Xtrn = (Xtr - mu) / sd
@@ -256,7 +346,7 @@ def main():
                 min_lr=args.min_lr,
             )
 
-        # ---- pos_weight from TRAIN only ----
+        # Compute positive class weight from the training split only.
         pos = float(ytr.sum())
         neg = float(len(ytr) - ytr.sum())
         pw = neg / max(pos, 1.0)
@@ -272,7 +362,6 @@ def main():
 
         hist_round, hist_train_loss, hist_val_loss = [], [], []
         hist_val_auroc, hist_val_prauc, hist_lr = [], [], []
-
         no_improve, epochs_used = 0, 0
 
         for rnd in range(1, args.rounds + 1):
@@ -286,20 +375,26 @@ def main():
                 b = min(n, (s + 1) * args.batch)
                 xb = torch.from_numpy(Xb[a:b]).to(device)
                 yy = torch.from_numpy(yb[a:b]).to(device).float()
-
                 opt.zero_grad(set_to_none=True)
                 logits = model(xb)
                 loss = criterion(logits, yy)
                 loss.backward()
                 opt.step()
 
-            # validate (AUROC/PR-AUC)
+            # Evaluate validation AUROC and PR-AUC for early stopping
+            # and learning rate scheduling.
             val_auroc, val_prauc = evaluate_metrics(model, Xvan, yva, device)
             if scheduler is not None:
                 scheduler.step(val_auroc)
 
-            train_loss = compute_loss(model, Xtrn, ytr, criterion, device, batch_size=args.loss_eval_batch)
-            val_loss = compute_loss(model, Xvan, yva, criterion, device, batch_size=args.loss_eval_batch)
+            train_loss = compute_loss(
+                model, Xtrn, ytr, criterion, device,
+                batch_size=args.loss_eval_batch
+            )
+            val_loss = compute_loss(
+                model, Xvan, yva, criterion, device,
+                batch_size=args.loss_eval_batch
+            )
 
             hist_round.append(rnd)
             hist_train_loss.append(train_loss)
@@ -308,7 +403,7 @@ def main():
             hist_val_prauc.append(val_prauc)
             hist_lr.append(get_lr(opt))
 
-            # ---- best checkpoint on VAL AUROC ----
+            # Save the best checkpoint based on validation AUROC.
             if val_auroc > best_val_auroc:
                 best_val_auroc = val_auroc
                 best_val_prauc = val_prauc
@@ -329,13 +424,16 @@ def main():
                 )
 
             if args.patience > 0 and no_improve >= args.patience:
-                print(f"[fold {fold_i}] early stop at round {rnd} (no val AUROC improvement for {args.patience} rounds)")
+                print(
+                    f"[fold {fold_i}] early stop at round {rnd} "
+                    f"(no val AUROC improvement for {args.patience} rounds)"
+                )
                 break
 
-        # save last
+        # Save the final model state regardless of early stopping.
         torch.save(model.state_dict(), last_path)
 
-        # save curves
+        # Save per-fold training curves as a compressed NumPy archive.
         curves_path = os.path.join(args.out_dir, f"central_fold{fold_i}_curves.npz")
         np.savez(
             curves_path,
@@ -347,33 +445,38 @@ def main():
             lr=np.array(hist_lr, dtype=np.float32),
         )
 
-        # save history CSV
+        # Save per-round training history as a CSV file.
         hist_csv = os.path.join(args.out_dir, f"central_fold{fold_i}_history.csv")
         with open(hist_csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["round", "train_loss", "val_loss", "val_auroc", "val_prauc", "lr"])
             for i in range(len(hist_round)):
-                w.writerow([hist_round[i], hist_train_loss[i], hist_val_loss[i],
-                            hist_val_auroc[i], hist_val_prauc[i], hist_lr[i]])
+                w.writerow([
+                    hist_round[i], hist_train_loss[i], hist_val_loss[i],
+                    hist_val_auroc[i], hist_val_prauc[i], hist_lr[i],
+                ])
 
-        # ---- test at BEST (val AUROC) ----
+        # Restore the best checkpoint and evaluate on the held-out test set.
         model.load_state_dict(torch.load(best_path, map_location=device))
         test_auroc, test_prauc = evaluate_metrics(model, Xten, yte, device)
 
-        # probs for thresholds
-        val_probs = predict_proba(model, Xvan, device)
+        # Compute predicted probabilities on validation and test sets
+        # for threshold selection and threshold-dependent metric evaluation.
+        val_probs  = predict_proba(model, Xvan, device)
         test_probs = predict_proba(model, Xten, device)
 
+        # Select thresholds on the validation set only; apply to the test set.
         thr_youden = find_best_threshold_youden(yva, val_probs)
-        thr_maxf1 = find_best_threshold_maxf1(yva, val_probs)
+        thr_maxf1  = find_best_threshold_maxf1(yva, val_probs)
 
         m_youden = threshold_metrics(yte, test_probs, thr_youden)
-        m_maxf1 = threshold_metrics(yte, test_probs, thr_maxf1)
-        m_05 = threshold_metrics(yte, test_probs, 0.5)
+        m_maxf1  = threshold_metrics(yte, test_probs, thr_maxf1)
+        m_05     = threshold_metrics(yte, test_probs, 0.5)
 
         final_lr = get_lr(opt)
         msg = (
-            f"[fold {fold_i}] DONE. best_val_AUROC={best_val_auroc:.4f} (round {best_round}) | "
+            f"[fold {fold_i}] DONE. best_val_AUROC={best_val_auroc:.4f} "
+            f"(round {best_round}) | "
             f"test_AUROC={test_auroc:.4f} test_PR-AUC={test_prauc:.4f} | "
             f"epochs_used={epochs_used} | final_lr={final_lr:.2e}"
         )
@@ -389,56 +492,52 @@ def main():
             best_val_auroc, best_val_prauc,
             test_auroc, test_prauc,
             best_round, epochs_used,
-            final_lr,
-            pw,
-
+            final_lr, pw,
             thr_youden, thr_maxf1,
-
-            m_youden["acc"], m_youden["precision"], m_youden["recall"], m_youden["specificity"], m_youden["f1"], m_youden["bal_acc"],
+            m_youden["acc"], m_youden["precision"], m_youden["recall"],
+            m_youden["specificity"], m_youden["f1"], m_youden["bal_acc"],
             m_youden["tp"], m_youden["fp"], m_youden["tn"], m_youden["fn"],
-
-            m_maxf1["acc"], m_maxf1["precision"], m_maxf1["recall"], m_maxf1["specificity"], m_maxf1["f1"], m_maxf1["bal_acc"],
+            m_maxf1["acc"], m_maxf1["precision"], m_maxf1["recall"],
+            m_maxf1["specificity"], m_maxf1["f1"], m_maxf1["bal_acc"],
             m_maxf1["tp"], m_maxf1["fp"], m_maxf1["tn"], m_maxf1["fn"],
-
-            m_05["acc"], m_05["precision"], m_05["recall"], m_05["specificity"], m_05["f1"], m_05["bal_acc"],
+            m_05["acc"], m_05["precision"], m_05["recall"],
+            m_05["specificity"], m_05["f1"], m_05["bal_acc"],
             m_05["tp"], m_05["fp"], m_05["tn"], m_05["fn"],
         ])
 
+    # Save the cross-validation summary CSV with per-fold results.
     with open(summary_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(summary_rows)
 
-    # ---- aggregate reporting ----
+    # Print aggregated cross-validation results.
     test_aurocs = [r[3] for r in summary_rows]
     test_praucs = [r[4] for r in summary_rows]
     m_auc = _mean_std(test_aurocs)
-    m_pr = _mean_std(test_praucs)
-    print("\n[CV TEST] AUROC mean±std:", m_auc[0], m_auc[1])
-    print("[CV TEST] PR-AUC mean±std:", m_pr[0], m_pr[1])
+    m_pr  = _mean_std(test_praucs)
+    print("\n[CV TEST] AUROC mean±std:", f"{m_auc[0]:.4f} ± {m_auc[1]:.4f}")
+    print("[CV TEST] PR-AUC mean±std:", f"{m_pr[0]:.4f} ± {m_pr[1]:.4f}")
 
-    # Aggregates for Youden threshold metrics
-    # indices in row: locate by header names for safety
     h = {name: i for i, name in enumerate(header)}
-    youden_f1 = [r[h["test_f1_youden"]] for r in summary_rows]
-    youden_rec = [r[h["test_rec_youden"]] for r in summary_rows]
-    youden_spec = [r[h["test_spec_youden"]] for r in summary_rows]
-    youden_bal = [r[h["test_balacc_youden"]] for r in summary_rows]
-    thr_y = [r[h["thr_val_youden"]] for r in summary_rows]
-
-    mf1_f1 = [r[h["test_f1_maxf1"]] for r in summary_rows]
-    thr_m = [r[h["thr_val_maxf1"]] for r in summary_rows]
+    youden_f1   = [r[h["test_f1_youden"]]      for r in summary_rows]
+    youden_rec  = [r[h["test_rec_youden"]]      for r in summary_rows]
+    youden_spec = [r[h["test_spec_youden"]]     for r in summary_rows]
+    youden_bal  = [r[h["test_balacc_youden"]]   for r in summary_rows]
+    thr_y       = [r[h["thr_val_youden"]]       for r in summary_rows]
+    mf1_f1      = [r[h["test_f1_maxf1"]]        for r in summary_rows]
+    thr_m       = [r[h["thr_val_maxf1"]]        for r in summary_rows]
 
     print("\n[CV TEST @ VAL-Youden threshold]")
-    print("  thr mean±std:", *_mean_std(thr_y))
-    print("  F1 mean±std:", *_mean_std(youden_f1))
-    print("  Recall mean±std:", *_mean_std(youden_rec))
-    print("  Specificity mean±std:", *_mean_std(youden_spec))
-    print("  BalAcc mean±std:", *_mean_std(youden_bal))
+    print(f"  thr mean±std: {_mean_std(thr_y)[0]:.4f} ± {_mean_std(thr_y)[1]:.4f}")
+    print(f"  F1 mean±std: {_mean_std(youden_f1)[0]:.4f} ± {_mean_std(youden_f1)[1]:.4f}")
+    print(f"  Recall mean±std: {_mean_std(youden_rec)[0]:.4f} ± {_mean_std(youden_rec)[1]:.4f}")
+    print(f"  Specificity mean±std: {_mean_std(youden_spec)[0]:.4f} ± {_mean_std(youden_spec)[1]:.4f}")
+    print(f"  BalAcc mean±std: {_mean_std(youden_bal)[0]:.4f} ± {_mean_std(youden_bal)[1]:.4f}")
 
     print("\n[CV TEST @ VAL-MaxF1 threshold]")
-    print("  thr mean±std:", *_mean_std(thr_m))
-    print("  F1 mean±std:", *_mean_std(mf1_f1))
+    print(f"  thr mean±std: {_mean_std(thr_m)[0]:.4f} ± {_mean_std(thr_m)[1]:.4f}")
+    print(f"  F1 mean±std: {_mean_std(mf1_f1)[0]:.4f} ± {_mean_std(mf1_f1)[1]:.4f}")
 
     print(f"\n[OK] wrote summary: {summary_path}")
     if meta:
