@@ -1,7 +1,9 @@
 # clientapp_hfl_passive_diabetes.py
-# Flower 1.26.1 — Passive silo HFL client.
-# Fix 1: node_idx passed by server in config (not env var)
-# Fix 2: explicit float32 casting when unpacking Array objects
+# Flower client for passive-silo HFL pre-training on the diabetes dataset.
+# Each client trains a local denoising autoencoder on its assigned passive-silo partition.
+# The server assigns the client index through the Flower configuration.
+# Flower arrays are converted to float32 tensors before PyTorch training.
+
 from __future__ import annotations
 import os
 from typing import Dict, Any
@@ -49,7 +51,7 @@ def _init_if_needed(ctx):
     K        = int(os.environ.get("K", 10))
     device   = os.environ.get("DEVICE", "cpu")
     node_id  = getattr(ctx, "node_id", 0)
-    node_idx = int(st.get("node_idx", 0))  # set by server via get_metadata
+    node_idx = int(st.get("node_idx", 0))  # Server-assigned client index used for local partition selection.
 
     d = np.load(npz_path, allow_pickle=True)
     X2 = d["X2"].astype(np.float32)
@@ -85,7 +87,7 @@ def get_metadata(msg: Message, ctx: Context) -> Message:
     st = _st(ctx)
     cfg = msg.content.get("config", None)
     if cfg is not None:
-        st["node_idx"] = int(cfg.get("node_idx", 0))  # MUST set before _init_if_needed
+        st["node_idx"] = int(cfg.get("node_idx", 0))  # Save the assigned client index before initialization.
     _init_if_needed(ctx)
     return Message(content=RecordDict({"config": ConfigRecord({
         "n_train": st["n_train"], "in_dim": st["in_dim"],
@@ -102,8 +104,11 @@ def get_stats(msg: Message, ctx: Context) -> Message:
 
 @app.query("get_embeddings")
 def get_embeddings(msg: Message, ctx: Context) -> Message:
-    """Option A: apply the converged encoder to this node's aligned cohort slice
-    and return the embeddings. Raw data never leaves the fog node."""
+    """Generate embeddings for the aligned cohort using the trained passive encoder.
+
+    Raw passive-silo data remains local to the HFL client. Only embeddings for the
+    requested aligned samples are returned to the server.
+    """
     _init_if_needed(ctx)
     st     = _st(ctx)
     dev    = st["dev"]
