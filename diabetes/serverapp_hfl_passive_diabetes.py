@@ -323,6 +323,7 @@ def main(grid: Grid, context: Context) -> None:
                             "local_epochs": local_epochs,
                             "batch_size":   batch_size,
                             "noise_std":    noise_std,
+                            "lr":           lr,
                             # Per-client per-round seed ensures diverse augmentation
                             # across clients within each round.
                             "seed": seed + 10000 * r + 97 * node_ids.index(nid),
