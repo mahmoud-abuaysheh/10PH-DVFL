@@ -1,8 +1,13 @@
+# make_diabetes_iid_partitions.py
+# Create stratified IID-style client partitions for the diabetes HFL experiment.
+# The script uses only the training indices from each fold and saves K-client
+# partitions for the requested values of K.
+
 import argparse, os, json
 import numpy as np
 
 def stratified_k_partition(indices: np.ndarray, y: np.ndarray, K: int, seed: int):
-    """Stratified split of indices into K disjoint partitions (IID-ish)."""
+    """Split training indices into K disjoint stratified client partitions."""
     rng = np.random.default_rng(seed)
     indices = indices.astype(np.int64)
     y_sub = y[indices]
