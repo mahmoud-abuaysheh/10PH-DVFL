@@ -1,28 +1,14 @@
 #!/usr/bin/env python3
 """
-Supervised pretraining for the *active* (label-holding) silo in the diabetes decoupled VFL setup.
+Train the active-silo encoder for the diabetes decoupled VFL experiment.
 
-Trains:
-  BottomMLP_Paper (in_dim -> 16 -> 8) + local linear head (8 -> 1)
+This script trains the active bottom encoder together with a temporary local
+supervised classification head using only the active feature view X1 and the
+labels y from the selected fold's training split.
 
-on ACTIVE features X1 and labels y, using the train split of the selected fold.
-
-Saves a "teacher" checkpoint containing BOTH bottom encoder + supervised head
-so the active client can later serve teacher logits to the server (knowledge distillation),
-while keeping VFL decoupled (no backprop to clients).
-
-Output checkpoint (per fold):
-  <out_dir>/pretrained_active_sup_teacher_fold{fold}.pt
-
-Checkpoint format:
-  {
-    "bottom_state": bottom.state_dict(),
-    "head_state": head.state_dict(),
-    "meta": meta
-  }
-
-- bottom_state is compatible with your client's _unwrap_state_dict() logic
-- head_state will be used by the active client to compute teacher logits
+Only the trained bottom encoder is used later to generate active-silo embeddings
+for the decoupled VFL stage. The local head is used only during supervised
+pre-training to provide a label-driven training signal.
 """
 
 from __future__ import annotations
@@ -37,9 +23,9 @@ import torch
 import torch.nn as nn
 
 
-# Must match your client architecture
+# Bottom encoder architecture used by the active diabetes silo.
 class BottomMLP_Paper(nn.Module):
-    """Baseline bottom: in_dim -> 16 -> 8 with ReLU."""
+    """Bottom encoder: input features -> 16 -> 8 with ReLU activations."""
     def __init__(self, in_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -109,13 +95,13 @@ def train_one_fold(
     Xs, _, _ = standardize_using_train(X1, tr)
 
     X_tr = torch.from_numpy(Xs[tr]).float().to(device)
-    y_tr = torch.from_numpy(y[tr]).float().to(device)  # BCE expects float
+    y_tr = torch.from_numpy(y[tr]).float().to(device)  # BCEWithLogitsLoss expects float labels.
 
     X_va: Optional[torch.Tensor]
     y_va_np: Optional[np.ndarray]
     if va is not None:
         X_va = torch.from_numpy(Xs[va]).float().to(device)
-        y_va_np = y[va].astype(np.int64)  # keep numpy for sklearn metrics
+        y_va_np = y[va].astype(np.int64)  # Keep labels as a NumPy array for sklearn metrics.
     else:
         X_va = None
         y_va_np = None
@@ -123,7 +109,7 @@ def train_one_fold(
     bottom = BottomMLP_Paper(in_dim=int(X_tr.shape[1])).to(device)
     head = nn.Linear(8, 1).to(device)
 
-    # pos_weight computed on train only
+    # Compute the positive-class weight from the training split only.
     pos = float(y[tr].sum())
     neg = float(len(tr) - y[tr].sum())
     pw = neg / max(pos, 1.0)
@@ -161,13 +147,13 @@ def train_one_fold(
             loss.backward()
             opt.step()
 
-        # Early stopping on val AUROC if val exists
+        # Use validation AUROC for early stopping when a valid validation split is available.
         if X_va is not None and y_va_np is not None and len(np.unique(y_va_np)) == 2:
             prob_va = predict_prob(bottom, head, X_va, batch=2048)
             from sklearn.metrics import roc_auc_score
             val_score = float(roc_auc_score(y_va_np, prob_va))
         else:
-            # fallback: -train loss (only if no validation split exists)
+            # Fall back to negative training loss if no usable validation split is available.
             bottom.eval()
             head.eval()
             with torch.no_grad():
@@ -184,7 +170,7 @@ def train_one_fold(
             if patience > 0 and no_improve >= patience:
                 break
 
-    # Restore best
+    # Restore the best validation checkpoint before saving.
     if best_bottom_state is not None:
         bottom.load_state_dict(best_bottom_state)
     if best_head_state is not None:
@@ -233,7 +219,7 @@ def main() -> None:
         {"bottom_state": bottom.state_dict(), "head_state": head.state_dict(), "meta": meta},
         out_path,
     )
-    print(f"[OK] Saved supervised active teacher (bottom+head) to: {out_path}")
+    print(f"[OK] Saved supervised active pre-training checkpoint to: {out_path}")
 
 
 if __name__ == "__main__":
