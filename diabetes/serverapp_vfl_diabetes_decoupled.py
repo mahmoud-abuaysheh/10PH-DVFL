@@ -1,4 +1,23 @@
 # serverapp_vfl_diabetes_decoupled.py
+#
+# Server application for the decoupled VFL diabetes experiment.
+#
+# This server implements Tier 2 of the 10PH-DVFL architecture:
+# - Requests frozen embeddings from the active and passive silos once per batch
+# - Trains only the lightweight fusion head (TopLinear) on the server side
+# - No gradients are returned to any silo at any point
+# - Supports two pre-training modes for the passive silo:
+#     "vfl": standard decoupled VFL (SSL or supervised active encoder)
+#     "passive_hfl_ssl": intra-silo HFL pre-training for the passive silo before VFL fusion
+#
+# Communication pattern (Tier 2):
+#   For each training batch:
+#     1. Request active embeddings from active silo (MSG_EMB, view=0)
+#     2. Request passive embeddings from passive silo (MSG_EMB, view=1)
+#     3. Request labels from active silo (MSG_Y)
+#     4. Concatenate embeddings, compute loss, update fusion head locally
+#     No gradients are sent back to either silo.
+
 from __future__ import annotations
 
 import csv
@@ -6,7 +25,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -19,14 +38,18 @@ from flwr.serverapp import Grid, ServerApp
 
 INFO = 20
 
-# MUST match client query handler names
+# Message type constants must match the handler names registered in the client application.
 MSG_EMB = "query.generate_embeddings"
 MSG_Y = "query.get_labels"
 MSG_HFL_FIT = "query.hfl_fit"
 
 
-# ---------------- utils ----------------
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
 def set_seed(seed: int) -> None:
+    """Fix all random seeds for reproducibility across numpy, torch, and CUDA."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -34,15 +57,26 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+# ---------------------------------------------------------------------------
+# Flower grid utilities
+# ---------------------------------------------------------------------------
+
 def _arr_i64(x: np.ndarray) -> Array:
+    """Convert a numpy array to a Flower Array with int64 dtype."""
     return Array(np.asarray(x, dtype=np.int64))
 
 
 def _cfg(d: Dict[str, object] | None = None) -> ConfigRecord:
+    """Wrap a plain dict as a Flower ConfigRecord."""
     return ConfigRecord(d or {})
 
 
 def _grid_request(grid: Grid, msg: Message, timeout: int = 300) -> Message:
+    """
+    Send a single message to a client node and return the reply.
+    Raises RuntimeError if the reply is empty or has no content,
+    which typically indicates a client crash or handler name mismatch.
+    """
     reps = grid.send_and_receive([msg], timeout=timeout)
     if not reps:
         raise RuntimeError("grid.send_and_receive returned empty list")
@@ -57,9 +91,12 @@ def _grid_request(grid: Grid, msg: Message, timeout: int = 300) -> Message:
 
 
 def get_node_ids(grid: Grid) -> List[int]:
+    """
+    Retrieve sorted node IDs from the Flower grid.
+    Tries multiple API access patterns to support different Flower versions.
+    """
     if hasattr(grid, "get_node_ids") and callable(getattr(grid, "get_node_ids")):
         return sorted([int(x) for x in grid.get_node_ids()])
-
     if hasattr(grid, "node_ids"):
         v = getattr(grid, "node_ids")
         if callable(v):
@@ -68,7 +105,6 @@ def get_node_ids(grid: Grid) -> List[int]:
             return sorted([int(x) for x in v])
         except TypeError:
             pass
-
     for attr in ("_node_ids", "_nodes", "nodes", "_node_registry", "_nodes_by_id"):
         if hasattr(grid, attr):
             obj = getattr(grid, attr)
@@ -76,7 +112,6 @@ def get_node_ids(grid: Grid) -> List[int]:
                 return sorted([int(k) for k in obj.keys()])
             if isinstance(obj, (list, tuple, set)):
                 return sorted([int(x) for x in obj])
-
     node_like = [a for a in dir(grid) if "node" in a.lower()]
     raise AttributeError(
         "Could not obtain node ids from grid. "
@@ -85,7 +120,10 @@ def get_node_ids(grid: Grid) -> List[int]:
 
 
 def _rcfg(run, key: str, default):
-    """Flower converts underscore keys to hyphens in run_config. Check both."""
+    """
+    Read a value from the Flower run configuration.
+    Flower converts underscore keys to hyphens internally, so both forms are checked.
+    """
     hyphen_key = key.replace("_", "-")
     if key in run:
         return run[key]
@@ -95,16 +133,27 @@ def _rcfg(run, key: str, default):
 
 
 def _sd_to_arrays(sd: Dict[str, torch.Tensor]) -> Dict[str, Array]:
+    """Convert a PyTorch state dict to a dict of Flower Arrays for transmission."""
     return {k: Array(v.detach().cpu().numpy().astype(np.float32)) for k, v in sd.items()}
 
 
 def _arrays_to_sd(arrs: Dict[str, Array], device: torch.device) -> Dict[str, torch.Tensor]:
+    """Convert a dict of Flower Arrays back to a PyTorch state dict on the given device."""
     return {k: torch.from_numpy(arr.numpy()).to(device) for k, arr in arrs.items()}
 
 
-# ---------------- model ----------------
+# ---------------------------------------------------------------------------
+# Server-side fusion head
+# ---------------------------------------------------------------------------
+
 class TopLinear(nn.Module):
-    """Top head for decoupled VFL. Input dim must match concat(emb_active, emb_passive)."""
+    """
+    Lightweight fusion head trained on the server in Tier 2.
+
+    Receives concatenated embeddings from the active and passive silos
+    and produces a scalar logit for binary classification.
+    Input dimensionality must equal emb_dim_active + emb_dim_passive.
+    """
 
     def __init__(self, in_dim: int):
         super().__init__()
@@ -114,44 +163,15 @@ class TopLinear(nn.Module):
         return self.fc(z).squeeze(1)
 
 
-class TeacherHead(nn.Module):
-    """Teacher head for ACTIVE-only embeddings (emb_dim -> 1)."""
-
-    def __init__(self, in_dim: int = 8):
-        super().__init__()
-        self.fc = nn.Linear(in_dim, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x).squeeze(1)
-
-
-def _load_teacher_head(teacher_ckpt_path: str, device: torch.device, emb_dim: int) -> TeacherHead:
-    if not os.path.exists(teacher_ckpt_path):
-        raise FileNotFoundError(f"Teacher checkpoint not found: {teacher_ckpt_path}")
-
-    state = torch.load(teacher_ckpt_path, map_location=device)
-    if not isinstance(state, dict):
-        raise RuntimeError(f"Teacher ckpt is not a dict: type={type(state)}")
-
-    if "head_state" not in state or not isinstance(state["head_state"], dict):
-        raise RuntimeError(f"Teacher ckpt missing 'head_state' dict keys={list(state.keys())}")
-
-    # raw keys {"weight","bias"} -> TeacherHead expects {"fc.weight","fc.bias"}
-    raw_sd = state["head_state"]
-    prefixed_sd = {f"fc.{k}": v for k, v in raw_sd.items()}
-
-    head = TeacherHead(in_dim=emb_dim).to(device)
-    head.load_state_dict(prefixed_sd, strict=True)
-
-    head.eval()
-    for p in head.parameters():
-        p.requires_grad_(False)
-
-    print(f"[teacher] loaded teacher head from: {teacher_ckpt_path}")
-    return head
-
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 def load_npz(npz_path: str):
+    """
+    Load the pre-computed cross-validation splits and labels from the NPZ file.
+    Returns labels y, the list of fold split dicts, and optional metadata.
+    """
     d = np.load(npz_path, allow_pickle=True)
     y = d["y"].astype(np.int64)
     folds = list(d["folds"])
@@ -159,7 +179,15 @@ def load_npz(npz_path: str):
     return y, folds, meta
 
 
+# ---------------------------------------------------------------------------
+# Evaluation utilities
+# ---------------------------------------------------------------------------
+
 def _pick_threshold_maxf1(y_true: np.ndarray, p: np.ndarray) -> float:
+    """
+    Select the classification threshold that maximises F1 score on the validation set.
+    This threshold is then applied to the test set without further tuning.
+    """
     ts = np.linspace(0.01, 0.99, 99)
     best_t, best_f1 = 0.5, -1.0
     for t in ts:
@@ -175,6 +203,7 @@ def _pick_threshold_maxf1(y_true: np.ndarray, p: np.ndarray) -> float:
 
 
 def _threshold_metrics(y_true: np.ndarray, p: np.ndarray, thr: float) -> Dict[str, float]:
+    """Compute threshold-dependent classification metrics at a fixed threshold."""
     yhat = (p >= thr).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, yhat, labels=[0, 1]).ravel()
     acc = (tp + tn) / max(tp + tn + fp + fn, 1)
@@ -205,6 +234,16 @@ def _eval_probs(
     emb_dim: int,
     timeout: int = 300,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Evaluate the fusion head over a set of sample indices.
+
+    For each batch:
+      1. Requests active embeddings from the active silo node
+      2. Requests passive embeddings from the passive silo node
+      3. Requests labels from the active silo node
+      4. Concatenates embeddings and runs the fusion head forward pass
+    Returns arrays of true labels and predicted probabilities.
+    """
     top.eval()
     y_all: List[np.ndarray] = []
     p_all: List[np.ndarray] = []
@@ -246,13 +285,18 @@ def _eval_probs(
         ex = rep_x.content["arrays"]["embedding"].numpy().astype(np.float32)
         ep = rep_p.content["arrays"]["embedding"].numpy().astype(np.float32)
         if ex.shape[1] != emb_dim or ep.shape[1] != emb_dim:
-            raise RuntimeError(f"Embedding dim mismatch: ex={ex.shape}, ep={ep.shape}, expected emb_dim={emb_dim}")
+            raise RuntimeError(
+                f"Embedding dim mismatch: ex={ex.shape}, ep={ep.shape}, expected emb_dim={emb_dim}"
+            )
 
         rep_y = _grid_request(
             grid,
             Message(
                 content=RecordDict(
-                    {"config": _cfg({"role": "active"}), "arrays": ArrayRecord({"batch_idx": _arr_i64(bidx)})}
+                    {
+                        "config": _cfg({"role": "active"}),
+                        "arrays": ArrayRecord({"batch_idx": _arr_i64(bidx)}),
+                    }
                 ),
                 dst_node_id=active_id,
                 message_type=MSG_Y,
@@ -271,7 +315,18 @@ def _eval_probs(
     return np.concatenate(y_all), np.concatenate(p_all)
 
 
+# ---------------------------------------------------------------------------
+# Main server logic
+# ---------------------------------------------------------------------------
+
 def server_main(grid: Grid, context: Context) -> None:
+    """
+    Entry point for the server application.
+
+    Dispatches to the passive HFL pre-training routine if mode is
+    'passive_hfl_ssl', otherwise runs the main Tier 2 decoupled VFL
+    fusion head training loop.
+    """
     run = context.run_config
     mode = str(_rcfg(run, "mode", "vfl")).strip().lower()
 
@@ -298,25 +353,8 @@ def server_main(grid: Grid, context: Context) -> None:
     patience = int(_rcfg(run, "patience", 15))
     emb_dim = int(_rcfg(run, "emb_dim", 8))
 
-    # ---- KD settings (ONLY used if mode == "kd") ----
-    kd_alpha = float(_rcfg(run, "kd_alpha", 0.5))
-    kd_T = float(_rcfg(run, "kd_T", 2.0))
-    teacher_ckpt_path = _rcfg(run, "teacher_ckpt_path", None)
-    teacher_ckpt_dir = str(_rcfg(run, "teacher_ckpt_dir", "./runs_active_sup_diabetes"))
-
-    teacher_head: Optional[TeacherHead] = None
-    if mode == "kd" and kd_alpha > 0.0:
-        if teacher_ckpt_path is None:
-            teacher_ckpt_path = os.path.join(teacher_ckpt_dir, f"pretrained_active_sup_teacher_fold{fold}.pt")
-        else:
-            teacher_ckpt_path = str(teacher_ckpt_path)
-        teacher_head = _load_teacher_head(teacher_ckpt_path, device=device, emb_dim=emb_dim)
-        print(f"[KD] enabled: kd_alpha={kd_alpha} kd_T={kd_T}")
-    else:
-        kd_alpha = 0.0
-        teacher_ckpt_path = ""
-        print("[KD] disabled (mode != kd)")
-
+    # Identify which grid nodes act as the active and passive silos.
+    # Node IDs are sorted deterministically; active silo is always node 0.
     node_ids = get_node_ids(grid)
     if len(node_ids) < 2:
         raise RuntimeError(f"Need 2 supernodes, got {node_ids}")
@@ -331,13 +369,16 @@ def server_main(grid: Grid, context: Context) -> None:
     va = split["val"].astype(np.int64)
     te = split["test"].astype(np.int64)
 
+    # Compute positive class weight from the training split to handle class imbalance.
     pos = float(y[tr].sum())
     neg = float(len(tr) - y[tr].sum())
     pw = neg / max(pos, 1.0)
 
-    criterion_sup = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], device=device))
-    criterion_kd = nn.BCEWithLogitsLoss()  # for soft targets
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], device=device))
 
+    # Initialise the server-side fusion head.
+    # Input dimension is twice the embedding dimension since active and passive
+    # embeddings are concatenated before classification.
     top = TopLinear(in_dim=2 * emb_dim).to(device)
     opt = torch.optim.Adam(top.parameters(), lr=lr_top)
 
@@ -345,44 +386,52 @@ def server_main(grid: Grid, context: Context) -> None:
     best_round = -1
     no_improve = 0
 
-    best_path = os.path.join(out_dir, f"decoupled_best_fold{fold}.pt")
+    # Checkpoint paths for the best fusion head and per-round training history.
+    best_path = os.path.join(out_dir, f"fusion_head_best_fold{fold}.pt")
     hist_path = os.path.join(out_dir, f"decoupled_fold{fold}_history.csv")
 
     with open(hist_path, "w", newline="") as f:
-        csv.writer(f).writerow(
-            ["round", "train_loss", "train_sup_loss", "train_kd_loss", "val_auroc", "val_prauc", "lr"]
-        )
+        csv.writer(f).writerow(["round", "train_loss", "val_auroc", "val_prauc", "lr"])
 
     n = len(tr)
     steps = math.ceil(n / batch)
 
+    # Tier 2 training loop.
+    # Each round requests frozen embeddings from both silos,
+    # concatenates them on the server, and updates only the fusion head.
+    # No gradients are returned to any silo at any point.
     for rnd in range(1, rounds + 1):
         top.train()
         perm = np.random.permutation(tr)
-
         train_loss_acc = 0.0
-        sup_loss_acc = 0.0
-        kd_loss_acc = 0.0
 
         for s in range(steps):
             bidx = perm[s * batch : min(n, (s + 1) * batch)].astype(np.int64)
 
+            # Request frozen active-silo embeddings.
             rep_x = _grid_request(
                 grid,
                 Message(
                     content=RecordDict(
-                        {"config": _cfg({"view": 0, "role": "active"}), "arrays": ArrayRecord({"batch_idx": _arr_i64(bidx)})}
+                        {
+                            "config": _cfg({"view": 0, "role": "active"}),
+                            "arrays": ArrayRecord({"batch_idx": _arr_i64(bidx)}),
+                        }
                     ),
                     dst_node_id=active_id,
                     message_type=MSG_EMB,
                 ),
             )
 
+            # Request frozen passive-silo embeddings.
             rep_p = _grid_request(
                 grid,
                 Message(
                     content=RecordDict(
-                        {"config": _cfg({"view": 1, "role": "passive"}), "arrays": ArrayRecord({"batch_idx": _arr_i64(bidx)})}
+                        {
+                            "config": _cfg({"view": 1, "role": "passive"}),
+                            "arrays": ArrayRecord({"batch_idx": _arr_i64(bidx)}),
+                        }
                     ),
                     dst_node_id=passive_id,
                     message_type=MSG_EMB,
@@ -392,61 +441,57 @@ def server_main(grid: Grid, context: Context) -> None:
             ex = rep_x.content["arrays"]["embedding"].numpy().astype(np.float32)
             ep = rep_p.content["arrays"]["embedding"].numpy().astype(np.float32)
             if ex.shape[1] != emb_dim or ep.shape[1] != emb_dim:
-                raise RuntimeError(f"Embedding dim mismatch in train: ex={ex.shape}, ep={ep.shape}, expected emb_dim={emb_dim}")
+                raise RuntimeError(
+                    f"Embedding dim mismatch in train: ex={ex.shape}, ep={ep.shape}, expected emb_dim={emb_dim}"
+                )
 
+            # Request labels from the active silo (passive silo has no label access).
             rep_y = _grid_request(
                 grid,
                 Message(
-                    content=RecordDict({"config": _cfg({"role": "active"}), "arrays": ArrayRecord({"batch_idx": _arr_i64(bidx)})}),
+                    content=RecordDict(
+                        {
+                            "config": _cfg({"role": "active"}),
+                            "arrays": ArrayRecord({"batch_idx": _arr_i64(bidx)}),
+                        }
+                    ),
                     dst_node_id=active_id,
                     message_type=MSG_Y,
                 ),
             )
             yb = rep_y.content["arrays"]["y"].numpy().astype(np.int64)
 
+            # Concatenate active and passive embeddings and update the fusion head.
             z = torch.from_numpy(np.concatenate([ex, ep], axis=1)).to(device)
             yy = torch.from_numpy(yb).float().to(device)
 
             opt.zero_grad(set_to_none=True)
-            logits_s = top(z)
-
-            sup_loss = criterion_sup(logits_s, yy)
-
-            if teacher_head is not None and kd_alpha > 0.0:
-                ex_t = torch.from_numpy(ex).to(device)
-                with torch.no_grad():
-                    logits_t = teacher_head(ex_t)
-                    p_t = torch.sigmoid(logits_t / kd_T)
-                kd_loss = criterion_kd(logits_s / kd_T, p_t) * (kd_T * kd_T)
-                loss = (1.0 - kd_alpha) * sup_loss + kd_alpha * kd_loss
-            else:
-                kd_loss = torch.tensor(0.0, device=device)
-                loss = sup_loss
-
+            logits = top(z)
+            loss = criterion(logits, yy)
             loss.backward()
             opt.step()
 
             frac = len(bidx) / n
             train_loss_acc += float(loss.item()) * frac
-            sup_loss_acc += float(sup_loss.item()) * frac
-            kd_loss_acc += float(kd_loss.item()) * frac
 
+        # Evaluate on the validation set using frozen embeddings from both silos.
         y_va, p_va = _eval_probs(grid, top, device, va, active_id, passive_id, emb_dim)
         val_auroc = float(roc_auc_score(y_va, p_va))
         val_prauc = float(average_precision_score(y_va, p_va))
         lr_now = float(opt.param_groups[0]["lr"])
 
         with open(hist_path, "a", newline="") as f:
-            csv.writer(f).writerow([rnd, train_loss_acc, sup_loss_acc, kd_loss_acc, val_auroc, val_prauc, lr_now])
+            csv.writer(f).writerow([rnd, train_loss_acc, val_auroc, val_prauc, lr_now])
 
         if rnd == 1 or rnd % 10 == 0 or rnd == rounds:
             print(
                 f"[fold {fold}] round {rnd:03d}/{rounds} "
-                f"loss={train_loss_acc:.4f} sup={sup_loss_acc:.4f} kd={kd_loss_acc:.4f} "
+                f"loss={train_loss_acc:.4f} "
                 f"val_AUROC={val_auroc:.4f} val_PR-AUC={val_prauc:.4f} "
                 f"best={best_val_auroc:.4f}@{best_round} lr={lr_now:.2e}"
             )
 
+        # Save the best fusion head checkpoint based on validation AUROC.
         if val_auroc > best_val_auroc:
             best_val_auroc = val_auroc
             best_round = rnd
@@ -455,13 +500,19 @@ def server_main(grid: Grid, context: Context) -> None:
         else:
             no_improve += 1
             if patience > 0 and no_improve >= patience:
-                print(f"[fold {fold}] early stop at round {rnd} (no val AUROC improvement for {patience} rounds)")
+                print(
+                    f"[fold {fold}] early stop at round {rnd} "
+                    f"(no val AUROC improvement for {patience} rounds)"
+                )
                 break
 
+    # Restore the best fusion head and evaluate on the held-out test set.
     top.load_state_dict(torch.load(best_path, map_location=device)["top"])
     y_va, p_va = _eval_probs(grid, top, device, va, active_id, passive_id, emb_dim)
     y_te, p_te = _eval_probs(grid, top, device, te, active_id, passive_id, emb_dim)
 
+    # Select the classification threshold on the validation set using max F1,
+    # then apply it to the test set without further tuning.
     thr = _pick_threshold_maxf1(y_va, p_va)
     tm_val = _threshold_metrics(y_va, p_va, thr)
     tm_te = _threshold_metrics(y_te, p_te, thr)
@@ -474,11 +525,6 @@ def server_main(grid: Grid, context: Context) -> None:
         w = csv.writer(f)
         w.writerow(["fold", "best_round", "best_val_auroc", "test_auroc", "test_prauc", "pos_weight_train"])
         w.writerow([fold, best_round, best_val_auroc, test_auroc, test_prauc, float(pw)])
-        w.writerow([])
-        w.writerow(["KD settings"])
-        w.writerow(["kd_alpha", float(kd_alpha)])
-        w.writerow(["kd_T", float(kd_T)])
-        w.writerow(["teacher_ckpt_path", teacher_ckpt_path])
         w.writerow([])
         w.writerow(["VAL (maxF1 threshold)"])
         for k, v in tm_val.items():
@@ -497,8 +543,24 @@ def server_main(grid: Grid, context: Context) -> None:
         print("[meta]", meta)
 
 
+# ---------------------------------------------------------------------------
+# Intra-silo HFL pre-training for the passive silo (Tier 1 optional stage)
+# ---------------------------------------------------------------------------
+
 def _run_passive_hfl_ssl(context: Context, grid: Grid, run: Dict[str, object]) -> None:
-    # unchanged: your passive HFL SSL pretrain
+    """
+    Run the intra-silo horizontal federated learning pre-training stage
+    for the passive silo encoder using a self-supervised objective.
+
+    This implements the optional Tier 1 HFL stage of the 10PH-DVFL architecture,
+    where the passive silo trains its encoder across K simulated IID clients
+    using FedAvg before the Tier 2 cross-silo fusion begins.
+
+    Each client trains the shared passive encoder locally using two augmented
+    tabular views of its partition (cosine similarity loss), then sends updated
+    weights back to the server for aggregation. The final aggregated encoder
+    checkpoint is saved and used as the passive silo encoder in Tier 2.
+    """
     seed = int(_rcfg(run, "seed", 42))
     set_seed(seed)
 
@@ -537,6 +599,7 @@ def _run_passive_hfl_ssl(context: Context, grid: Grid, run: Dict[str, object]) -
     global_model = BottomMLP_Paper(in_dim=int(X2.shape[1])).to(device)
     global_sd = global_model.state_dict()
 
+    # Partition the passive silo training data into K IID client partitions.
     parts = np.array_split(tr, K)
     client_indices_path = out_dir / f"client_indices_fold{fold}.npz"
     np.savez_compressed(client_indices_path, **{f"c{i}": parts[i].astype(np.int64) for i in range(K)})
@@ -566,6 +629,8 @@ def _run_passive_hfl_ssl(context: Context, grid: Grid, run: Dict[str, object]) -
             replies = []
             losses = []
             ns = []
+
+            # Send global encoder weights to each client and collect local updates.
             for rank, nid in enumerate(node_ids):
                 msg = Message(
                     message_type=MSG_HFL_FIT,
@@ -596,6 +661,7 @@ def _run_passive_hfl_ssl(context: Context, grid: Grid, run: Dict[str, object]) -
                 losses.append(loss)
                 replies.append(rep)
 
+            # Aggregate client updates using FedAvg weighted by local dataset size.
             total = float(sum(ns)) if ns else 1.0
             new_sd = {k: torch.zeros_like(v) for k, v in global_sd.items()}
             for rep, n in zip(replies, ns):
@@ -609,10 +675,15 @@ def _run_passive_hfl_ssl(context: Context, grid: Grid, run: Dict[str, object]) -
             if r % max(1, rounds // 5) == 0 or r == 1 or r == rounds:
                 log(INFO, f"[PASSIVE_HFL_SSL] round={r}/{rounds} avg_loss={avg_loss:.6f}")
 
+    # Save the final aggregated passive encoder checkpoint for use in Tier 2.
     ckpt_path = out_dir / f"pretrained_passive_bottom_hfl_fold{fold}.pt"
     torch.save({"bottom_state": {k: v.detach().cpu() for k, v in global_sd.items()}}, ckpt_path)
     log(INFO, f"[PASSIVE_HFL_SSL] saved {ckpt_path}")
 
+
+# ---------------------------------------------------------------------------
+# Flower ServerApp entry point
+# ---------------------------------------------------------------------------
 
 app = ServerApp()
 
