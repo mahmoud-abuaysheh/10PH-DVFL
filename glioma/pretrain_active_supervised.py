@@ -1,21 +1,31 @@
-"""
-pretrain_active_supervised.py
-==============================
-Standalone supervised pretraining for the ACTIVE silo encoder.
-
-Trains BottomMLP (27→32→16) + TopMLP (16→16→8→1) jointly on X1 features
-using BCE loss with pos_weight (matching the VFL downstream setup).
-
-Saves per-fold checkpoint containing:
-  - bottom_state  : encoder weights  (used by Experiment 1 VFL)
-  - head_state    : classifier weights (used by Experiment 2 distillation as teacher)
-
-Usage:
-    python pretrain_active_supervised.py [--epochs 100] [--out_dir runs_sup_pretrain]
-
-Outputs (one per fold):
-    <out_dir>/pretrained_active_bottom_sup_fold{1..5}.pt
-"""
+# pretrain_active_supervised_glioma.py
+#
+# Supervised pre-training for the active-silo encoder in the glioma
+# decoupled VFL experiment.
+#
+# This script implements the supervised pre-training stage (Tier 1) for the
+# active silo encoder. It trains the bottom MLP encoder together with a
+# temporary local classification head using only the active-silo feature
+# view X1 and the labels y from the selected fold's training split.
+#
+# Only the trained bottom encoder checkpoint is saved and used later to
+# generate active-silo embeddings for the Tier 2 decoupled VFL fusion stage.
+# The temporary classification head provides the supervised training signal
+# but is never transmitted to any other party. It is also saved alongside the
+# encoder for reference but plays no role in downstream VFL fusion.
+#
+# Architecture:
+#   BottomMLP: input -> 32 -> ReLU -> Dropout(0.0) -> 16 -> ReLU
+#   TopMLP:    16 -> 16 -> ReLU -> 8 -> ReLU -> 1
+#
+# The Dropout layer is included at dropout=0.0 to maintain checkpoint
+# compatibility with the HFL and VFL client scripts which use the same
+# BottomMLP definition.
+#
+# Output:
+#     pretrained_active_bottom_sup_fold{fold}.pt
+#         Contains 'bottom_state', 'head_state', and fold-specific
+#         standardization statistics for reproducibility.
 
 import argparse
 import os
@@ -27,10 +37,21 @@ import torch.nn as nn
 
 
 # ---------------------------------------------------------------------------
-# Architecture  — must exactly match clientapp_vfl_glioma_router_client_both_ssl.py
+# Model definitions
 # ---------------------------------------------------------------------------
 
 class BottomMLP(nn.Module):
+    """
+    Bottom encoder used by the active silo in the decoupled VFL architecture.
+
+    Projects active-silo input features through two linear layers with
+    ReLU activations to produce a 16-dimensional embedding vector.
+    Architecture: input -> 32 -> ReLU -> Dropout -> 16 -> ReLU
+
+    The Dropout layer is included at dropout=0.0 (disabled) to maintain
+    checkpoint key compatibility with the HFL and VFL client scripts which
+    use the same architecture definition with Dropout present.
+    """
     def __init__(self, in_dim: int, out_dim: int = 16, dropout: float = 0.0):
         super().__init__()
         self.net = nn.Sequential(
@@ -46,9 +67,15 @@ class BottomMLP(nn.Module):
 
 
 class TopMLP(nn.Module):
-    """Supervised pretraining head: takes only z1 (out_dim=16) as input.
-    NOTE: VFL head takes in_dim=32 (z1+z2 concat) — different size.
-    This head is saved as the distillation teacher for Experiment 2."""
+    """
+    Temporary local classification head used only during supervised
+    pre-training of the active-silo encoder.
+
+    Takes only z1 (out_dim=16) as input — note this differs from the
+    VFL fusion head which takes concatenated z1+z2 (in_dim=32). This
+    head is discarded after pre-training and is never used in Tier 2.
+    Architecture: 16 -> 16 -> ReLU -> 8 -> ReLU -> 1
+    """
     def __init__(self, in_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -64,10 +91,15 @@ class TopMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Data loading  — same as client
+# Data loading
 # ---------------------------------------------------------------------------
 
 def load_npz(npz_path: str):
+    """
+    Load the pre-computed cross-validation dataset from the NPZ file.
+    Returns active-silo features X1, passive-silo features X2 (unused),
+    labels y, and fold splits.
+    """
     d     = np.load(npz_path, allow_pickle=True)
     X1    = d["X1"].astype(np.float32)
     X2    = d["X2"].astype(np.float32)
@@ -93,63 +125,82 @@ def train_fold(
     out_dir: Path,
     npz_path: str,
     device: torch.device,
-):
+) -> Path:
+    """
+    Train the active-silo bottom encoder and temporary classification head
+    for a single cross-validation fold using supervised pre-training.
+
+    Training uses BCEWithLogitsLoss with per-fold positive class weighting
+    to handle the class imbalance in the glioma dataset. Standardization
+    is computed from the training split only to prevent leakage.
+
+    Returns the path to the saved checkpoint.
+    """
     split_obj = folds[fold - 1]
     split     = split_obj.item() if hasattr(split_obj, "item") else split_obj
     tr_idx    = split["train"].astype(np.int64)
     va_idx    = split["val"].astype(np.int64)
 
-    # Normalize using training set stats — same as client _init_if_needed
-    mu = X1[tr_idx].mean(axis=0, keepdims=True)
-    sd = X1[tr_idx].std(axis=0, keepdims=True) + 1e-8
+    # Standardize using training split statistics only to prevent leakage.
+    mu  = X1[tr_idx].mean(axis=0, keepdims=True)
+    sd  = X1[tr_idx].std(axis=0, keepdims=True) + 1e-8
     X1s = (X1 - mu) / sd
 
     X1t = torch.from_numpy(X1s).float().to(device)
     yt  = torch.from_numpy(y.astype(np.float32)).to(device)
 
-    # pos_weight — same as _ensure_vfl_head and pretrain_supervised in client
-    y_tr      = yt[torch.from_numpy(tr_idx).long().to(device)]
-    pos       = float(y_tr.sum().item())
-    neg       = float(y_tr.numel() - y_tr.sum().item())
+    # Compute positive class weight from the training split only.
+    y_tr       = yt[torch.from_numpy(tr_idx).long().to(device)]
+    pos        = float(y_tr.sum().item())
+    neg        = float(y_tr.numel() - y_tr.sum().item())
     pos_weight = torch.tensor([neg / max(pos, 1.0)], dtype=torch.float32).to(device)
     criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    np.random.seed(seed); torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     bottom = BottomMLP(in_dim=X1.shape[1], out_dim=out_dim).to(device)
     head   = TopMLP(in_dim=out_dim).to(device)
     opt    = torch.optim.Adam(
         list(bottom.parameters()) + list(head.parameters()), lr=lr
     )
 
-    rng = np.random.default_rng(seed)
+    rng             = np.random.default_rng(seed)
     steps_per_epoch = int(np.ceil(len(tr_idx) / batch_size))
 
-    print(f"\n[Fold {fold}] Starting supervised pretraining for {epochs} epochs...")
+    print(f"\n[Fold {fold}] Starting supervised pre-training for {epochs} epochs...")
+
     for ep in range(1, epochs + 1):
-        bottom.train(); head.train()
+        bottom.train()
+        head.train()
         tr_copy = tr_idx.copy()
         rng.shuffle(tr_copy)
-        loss_sum = 0.0; n = 0
+        loss_sum = 0.0
+        n = 0
+
         for s in range(steps_per_epoch):
-            b  = tr_copy[s * batch_size : (s + 1) * batch_size]
+            b = tr_copy[s * batch_size : (s + 1) * batch_size]
             if b.size == 0:
                 continue
-            bt = torch.from_numpy(b).long().to(device)
-            xb = X1t.index_select(0, bt)
-            yb = yt.index_select(0, bt)
+            bt     = torch.from_numpy(b).long().to(device)
+            xb     = X1t.index_select(0, bt)
+            yb     = yt.index_select(0, bt)
             opt.zero_grad(set_to_none=True)
             z1     = bottom(xb)
             logits = head(z1)
             loss   = criterion(logits, yb)
             loss.backward()
             opt.step()
-            loss_sum += float(loss.item()) * len(b); n += len(b)
+            loss_sum += float(loss.item()) * len(b)
+            n        += len(b)
+
         avg_loss = loss_sum / max(n, 1)
 
-        # Validation AUROC every 10 epochs and on last epoch
+        # Evaluate validation AUROC every 10 epochs and on the last epoch.
         if ep % 10 == 0 or ep == epochs:
             from sklearn.metrics import roc_auc_score, average_precision_score
-            bottom.eval(); head.eval()
+            bottom.eval()
+            head.eval()
             with torch.no_grad():
                 va_bt    = torch.from_numpy(va_idx).long().to(device)
                 z1_val   = bottom(X1t.index_select(0, va_bt))
@@ -161,14 +212,19 @@ def train_fold(
                 prauc = average_precision_score(y_val, probs_v)
             except Exception:
                 auroc = prauc = float("nan")
-            print(f"  ep={ep:3d}/{epochs}  train_loss={avg_loss:.4f}  val_AUROC={auroc:.4f}  val_PR-AUC={prauc:.4f}")
+            print(
+                f"  ep={ep:3d}/{epochs}  train_loss={avg_loss:.4f}  "
+                f"val_AUROC={auroc:.4f}  val_PR-AUC={prauc:.4f}"
+            )
         else:
             print(f"  ep={ep:3d}/{epochs}  train_loss={avg_loss:.4f}")
 
-    # Save checkpoint — bottom_state + head_state
+    # Save the encoder and head checkpoint.
+    # The bottom encoder is used in Tier 2 to generate active-silo embeddings.
+    # The head is retained for reference but is not used in downstream VFL.
     ckpt = {
         "bottom_state": bottom.state_dict(),
-        "head_state":   head.state_dict(),      # for distillation teacher (Experiment 2)
+        "head_state":   head.state_dict(),
         "fold":         fold,
         "seed":         seed,
         "out_dim":      out_dim,
@@ -180,7 +236,7 @@ def train_fold(
     }
     save_path = out_dir / f"pretrained_active_bottom_sup_fold{fold}.pt"
     torch.save(ckpt, save_path)
-    print(f"[Fold {fold}] Saved -> {save_path}  (bottom_state + head_state)")
+    print(f"[Fold {fold}] Saved -> {save_path}")
     return save_path
 
 
@@ -188,20 +244,31 @@ def train_fold(
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     here = Path(__file__).resolve().parent
 
-    parser = argparse.ArgumentParser(description="Supervised pretraining for active encoder")
-    parser.add_argument("--npz",        default=str(here / "glioma_aligned_vfl_hfl_cv.npz"))
-    parser.add_argument("--epochs",     type=int,   default=100)
-    parser.add_argument("--batch_size", type=int,   default=64)
-    parser.add_argument("--lr",         type=float, default=0.001)
-    parser.add_argument("--out_dim",    type=int,   default=16)
-    parser.add_argument("--seed",       type=int,   default=42)
-    parser.add_argument("--folds",      type=int,   nargs="+", default=[1, 2, 3, 4, 5])
-    parser.add_argument("--out_dir",    default=str(here / "runs_sup_pretrain"))
-    parser.add_argument("--device",     default="cpu")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Supervised pre-training for the glioma active-silo encoder."
+    )
+    ap.add_argument("--npz",        default=str(here / "glioma_aligned_vfl_hfl_cv.npz"),
+                    help="Path to glioma_aligned_vfl_hfl_cv.npz")
+    ap.add_argument("--epochs",     type=int,   default=100,
+                    help="Number of pre-training epochs")
+    ap.add_argument("--batch_size", type=int,   default=64,
+                    help="Training batch size")
+    ap.add_argument("--lr",         type=float, default=1e-3,
+                    help="Adam learning rate")
+    ap.add_argument("--out_dim",    type=int,   default=16,
+                    help="Encoder output dimensionality")
+    ap.add_argument("--seed",       type=int,   default=42,
+                    help="Random seed for reproducibility")
+    ap.add_argument("--folds",      type=int,   nargs="+", default=[1, 2, 3, 4, 5],
+                    help="Fold indices to train (1-based)")
+    ap.add_argument("--out_dir",    default=str(here / "runs_sup_pretrain"),
+                    help="Directory to write encoder checkpoints")
+    ap.add_argument("--device",     default="cpu",
+                    help="Device to use: cpu or cuda")
+    args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -209,14 +276,14 @@ def main():
     device = torch.device(args.device)
     X1, X2, y, folds = load_npz(args.npz)
 
-    print(f"Supervised pretraining — Active encoder")
-    print(f"  NPZ: {args.npz}")
-    print(f"  X1 shape: {X1.shape}  |  out_dim={args.out_dim}")
-    print(f"  epochs={args.epochs}  lr={args.lr}  batch_size={args.batch_size}")
-    print(f"  folds: {args.folds}")
-    print(f"  out_dir: {out_dir}")
-    print(f"  Architecture: BottomMLP({X1.shape[1]}->32->{args.out_dim}) + TopMLP({args.out_dim}->16->8->1)")
-    print()
+    print(f"Supervised pre-training — Active encoder")
+    print(f"  NPZ:          {args.npz}")
+    print(f"  X1 shape:     {X1.shape}  |  out_dim={args.out_dim}")
+    print(f"  epochs={args.epochs}  lr={args.lr}  batch_size={args.batch_size}  seed={args.seed}")
+    print(f"  folds:        {args.folds}")
+    print(f"  out_dir:      {out_dir}")
+    print(f"  Architecture: BottomMLP({X1.shape[1]}->32->{args.out_dim}) + "
+          f"TopMLP({args.out_dim}->16->8->1)")
 
     for fold in args.folds:
         train_fold(
@@ -233,8 +300,7 @@ def main():
         )
 
     print("\nAll folds done.")
-    print(f"Checkpoints in: {out_dir}")
-    print("Each file contains: bottom_state (for VFL) + head_state (for distillation teacher)")
+    print(f"Checkpoints written to: {out_dir}")
 
 
 if __name__ == "__main__":
