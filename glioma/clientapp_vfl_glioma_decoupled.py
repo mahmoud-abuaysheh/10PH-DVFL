@@ -5,31 +5,26 @@
 # This client implements the silo-side behaviour for both the active and passive
 # silos in Tier 2 of the 10PH-DVFL architecture for the glioma dataset.
 #
+# Two-stage protocol:
+#   Stage A — send_embeddings handler:
+#     Called once per split (train/val/test) by the server. Returns the full
+#     embedding matrix for the requested split in a single message. Since
+#     encoders are frozen after Tier 1, this one-time transfer is sufficient
+#     for all subsequent fusion head training in Stage B.
+#   Stage B — no handlers called:
+#     The server trains the fusion head entirely on cached embeddings.
+#     No messages are sent to any client node during Stage B.
+#
 # Roles handled by this client:
 #   "active"  : Loads the pre-trained active-silo encoder. Responds to
-#               embedding requests using X1 and label requests using y.
-#               The active silo is the only party with access to labels.
-#   "passive" : Loads the pre-trained passive-silo encoder (from local SSL
-#               or HFL pre-training). Responds to embedding requests using X2.
-#               The passive silo has no access to labels at any point.
-#
-# All encoders are frozen after Tier 1 pre-training. During Tier 2, clients
-# only serve pre-computed embeddings. No gradients are received from the server.
+#               send_embeddings with X1 and get_labels with y.
+#   "passive" : Loads the pre-trained passive-silo encoder. Responds to
+#               send_embeddings with X2.
 #
 # Key architectural differences from the diabetes decoupled client:
 #   - BottomMLP: input -> 32 -> ReLU -> Dropout(0.0) -> 16 -> ReLU
-#     instead of input -> 16 -> ReLU -> 8 -> ReLU
 #   - The Dropout layer is included at dropout=0.0 to maintain checkpoint
-#     key compatibility with the HFL pre-training scripts which use the same
-#     BottomMLP definition with Dropout present.
-#
-# Checkpoint loading logic:
-#   active  : loads pretrained_active_bottom_sup_fold{fold}.pt or
-#             pretrained_active_bottom_ssl_fold{fold}.pt depending on
-#             which pre-training mode was used
-#   passive : loads pretrained_passive_bottom_hfl_fold{fold}.pt if
-#             available (HFL pre-training), otherwise falls back to
-#             pretrained_passive_bottom_ssl_fold{fold}.pt (local SSL)
+#     key compatibility with HFL scripts which define BottomMLP with Dropout.
 
 from __future__ import annotations
 
@@ -45,8 +40,6 @@ import torch.nn as nn
 from flwr.app import Array, ArrayRecord, ConfigRecord, Context, Message, RecordDict
 from flwr.clientapp import ClientApp
 
-# Module-level cache to persist loaded data and models across handler calls
-# within the same client process, avoiding repeated disk reads.
 _CACHE: Dict[str, Dict] = {}
 
 
@@ -73,7 +66,7 @@ def _get_cache(context: Context) -> Dict:
 # ---------------------------------------------------------------------------
 
 def set_seed(seed: int) -> None:
-    """Fix all random seeds for reproducibility across numpy, torch, and CUDA."""
+    """Fix all random seeds for reproducibility."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -87,15 +80,11 @@ class BottomMLP(nn.Module):
     """
     Bottom encoder used by each silo in the glioma decoupled VFL architecture.
 
-    Projects silo-specific input features through two linear layers with
-    ReLU activations to produce a 16-dimensional embedding vector.
-    Architecture: input -> 32 -> ReLU -> Dropout -> 16 -> ReLU
+    Architecture: input -> 32 -> ReLU -> Dropout(0.0) -> 16 -> ReLU
 
-    The Dropout layer is included at dropout=0.0 (disabled by default) to
-    maintain checkpoint key compatibility with clientapp_hfl_passive_glioma.py
-    and serverapp_hfl_passive_glioma.py which define BottomMLP with Dropout.
-    If the Dropout layer were absent here, loading HFL-pre-trained checkpoints
-    would fail due to key mismatch in the state dict.
+    The Dropout layer is included at dropout=0.0 to maintain checkpoint key
+    compatibility with clientapp_hfl_passive_glioma.py and
+    serverapp_hfl_passive_glioma.py which define BottomMLP with Dropout present.
     """
     def __init__(self, in_dim: int, out_dim: int = 16, dropout: float = 0.0):
         super().__init__()
@@ -116,11 +105,7 @@ class BottomMLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 def load_npz(npz_path: str):
-    """
-    Load the pre-computed cross-validation dataset from the NPZ file.
-    Returns feature matrices X1 and X2, labels y, fold splits, and metadata.
-    X1 contains active-silo features; X2 contains passive-silo features.
-    """
+    """Load the cross-validation dataset from the NPZ file."""
     d     = np.load(npz_path, allow_pickle=True)
     X1    = d["X1"].astype(np.float32)
     X2    = d["X2"].astype(np.float32)
@@ -131,10 +116,7 @@ def load_npz(npz_path: str):
 
 
 def _standardize_using_train(X: np.ndarray, tr_idx: np.ndarray) -> np.ndarray:
-    """
-    Standardize features using mean and standard deviation computed from
-    the training split only, preventing any leakage from validation or test sets.
-    """
+    """Standardize using training split statistics only."""
     mu = X[tr_idx].mean(axis=0, keepdims=True)
     sd = X[tr_idx].std(axis=0, keepdims=True) + 1e-8
     return (X - mu) / sd
@@ -150,13 +132,7 @@ def _cfg(d: Dict[str, object] | None = None) -> ConfigRecord:
 
 
 def _unwrap_state_dict(state: object) -> Dict[str, torch.Tensor]:
-    """
-    Extract the encoder state dict from a checkpoint file.
-
-    Supports multiple checkpoint formats by checking for common key names
-    before falling back to treating the entire dict as a state dict.
-    Also handles DataParallel checkpoints by stripping 'module.' prefixes.
-    """
+    """Extract the encoder state dict from a checkpoint file."""
     if not isinstance(state, dict):
         raise RuntimeError(f"Checkpoint is not a dict; got type={type(state)}")
     if "bottom_state" in state and isinstance(state["bottom_state"], dict):
@@ -182,9 +158,10 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
     """
     Initialise the client node for the role requested by the server.
 
-    Called at the start of each handler. Is a no-op if the client has already
-    been initialised for the requested role. Loads the dataset, applies
-    fold-specific standardization, and loads the appropriate encoder checkpoint.
+    Loads the dataset, applies fold-specific standardization, and loads
+    the appropriate pre-trained encoder checkpoint. Stores the full
+    standardized feature matrices for all splits so that Stage A can
+    serve the complete embedding matrix for any split in one call.
 
     Checkpoint priority:
       active  : supervised checkpoint takes priority over SSL checkpoint
@@ -195,58 +172,52 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
     if cache.get(key, False):
         return
 
-    run    = context.run_config
+    run     = context.run_config
     DEFAULT_NPZ = Path(__file__).resolve().parent / "glioma_aligned_vfl_hfl_cv.npz"
-    npz    = str(run.get("npz", str(DEFAULT_NPZ)))
-    fold   = int(os.environ.get("FOLD", run.get("fold", 1)))
-    seed   = int(run.get("seed", 42))
-    device = str(run.get("device", "cpu"))
+    npz     = str(run.get("npz", str(DEFAULT_NPZ)))
+    fold    = int(os.environ.get("FOLD", run.get("fold", 1)))
+    seed    = int(run.get("seed", 42))
+    device  = str(run.get("device", "cpu"))
     out_dim = int(run.get("out_feature_dim", 16))
 
-    # Read checkpoint directories from the Flower run configuration.
     active_dir  = str(run.get("active_ckpt_dir",  "./runs_sup_pretrain"))
     passive_dir = str(run.get("passive_ckpt_dir", "./runs_passive_ssl_glioma"))
 
-    # Active encoder: supervised pre-training takes priority over SSL.
-    active_ckpt_sup = os.path.join(
-        active_dir, f"pretrained_active_bottom_sup_fold{fold}.pt"
-    )
-    active_ckpt_ssl = os.path.join(
-        active_dir, f"pretrained_active_bottom_ssl_fold{fold}.pt"
-    )
-
-    # Passive encoder: HFL pre-training takes priority over local SSL.
-    passive_ckpt_hfl = os.path.join(
-        passive_dir, f"pretrained_passive_bottom_hfl_fold{fold}.pt"
-    )
-    passive_ckpt_local = os.path.join(
-        passive_dir, f"pretrained_passive_bottom_ssl_fold{fold}.pt"
-    )
+    active_ckpt_sup    = os.path.join(active_dir,  f"pretrained_active_bottom_sup_fold{fold}.pt")
+    active_ckpt_ssl    = os.path.join(active_dir,  f"pretrained_active_bottom_ssl_fold{fold}.pt")
+    passive_ckpt_hfl   = os.path.join(passive_dir, f"pretrained_passive_bottom_hfl_fold{fold}.pt")
+    passive_ckpt_local = os.path.join(passive_dir, f"pretrained_passive_bottom_ssl_fold{fold}.pt")
 
     set_seed(seed)
     dev = torch.device(device)
 
     X1, X2, y, folds, meta = load_npz(npz)
     split_obj = folds[fold - 1]
-    split     = split_obj.item() if hasattr(split_obj, "item") else split_obj
-    tr        = split["train"].astype(np.int64)
+    split_    = split_obj.item() if hasattr(split_obj, "item") else split_obj
+    tr = split_["train"].astype(np.int64)
+    va = split_["val"].astype(np.int64)
+    te = split_["test"].astype(np.int64)
 
-    # Standardize both feature matrices using training split statistics only.
     X1s = _standardize_using_train(X1, tr)
     X2s = _standardize_using_train(X2, tr)
 
     cache["dev"]  = dev
     cache["meta"] = meta
     cache["fold"] = fold
-    cache["X1"]   = torch.from_numpy(X1s).float().to(dev)
-    cache["X2"]   = torch.from_numpy(X2s).float().to(dev)
-    cache["y"]    = torch.from_numpy(y).long().to(dev)
+    cache["tr"]   = tr
+    cache["va"]   = va
+    cache["te"]   = te
 
-    m0 = BottomMLP(in_dim=int(cache["X1"].shape[1]), out_dim=out_dim).to(dev)
-    m1 = BottomMLP(in_dim=int(cache["X2"].shape[1]), out_dim=out_dim).to(dev)
+    # Store full standardized feature matrices for all splits so Stage A
+    # can serve the complete embedding matrix for any split in one call.
+    cache["X1"] = torch.from_numpy(X1s).float()
+    cache["X2"] = torch.from_numpy(X2s).float()
+    cache["y"]  = torch.from_numpy(y).long()
+
+    m0 = BottomMLP(in_dim=int(X1.shape[1]), out_dim=out_dim).to(dev)
+    m1 = BottomMLP(in_dim=int(X2.shape[1]), out_dim=out_dim).to(dev)
 
     if desired_role == "active":
-        # Load active-silo encoder; supervised checkpoint takes priority.
         if os.path.exists(active_ckpt_sup):
             ckpt_path = active_ckpt_sup
         elif os.path.exists(active_ckpt_ssl):
@@ -259,12 +230,11 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
         state = torch.load(ckpt_path, map_location=dev)
         sd    = _unwrap_state_dict(state)
         m0.load_state_dict(sd, strict=True)
-        cache["model_for_view0"] = m0
-        cache["model_for_view1"] = m1  # Not used by the active role.
+        cache["model_active"]  = m0
+        cache["model_passive"] = m1
         print(f"[Client init][ACTIVE] loaded {ckpt_path}")
 
     elif desired_role == "passive":
-        # Load passive-silo encoder; HFL checkpoint takes priority over local SSL.
         if os.path.exists(passive_ckpt_hfl):
             ckpt_path = passive_ckpt_hfl
         elif os.path.exists(passive_ckpt_local):
@@ -277,16 +247,15 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
         state = torch.load(ckpt_path, map_location=dev)
         sd    = _unwrap_state_dict(state)
         m1.load_state_dict(sd, strict=True)
-        cache["model_for_view0"] = m0  # Not used by the passive role.
-        cache["model_for_view1"] = m1
+        cache["model_active"]  = m0
+        cache["model_passive"] = m1
         print(f"[Client init][PASSIVE] loaded {ckpt_path}")
 
     else:
         raise RuntimeError(f"Unknown desired_role={desired_role}")
 
     # Freeze all encoder parameters after Tier 1 pre-training.
-    # Encoders are never updated during Tier 2 fusion head training.
-    for m in (cache["model_for_view0"], cache["model_for_view1"]):
+    for m in (cache["model_active"], cache["model_passive"]):
         for p in m.parameters():
             p.requires_grad_(False)
         m.eval()
@@ -298,6 +267,18 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
     )
 
 
+def _get_split_indices(cache: Dict, split: str) -> torch.Tensor:
+    """Return the index tensor for the requested split name."""
+    if split == "train":
+        return torch.from_numpy(cache["tr"]).long()
+    elif split == "val":
+        return torch.from_numpy(cache["va"]).long()
+    elif split == "test":
+        return torch.from_numpy(cache["te"]).long()
+    else:
+        raise ValueError(f"Unknown split: {split}")
+
+
 # ---------------------------------------------------------------------------
 # Flower ClientApp and handlers
 # ---------------------------------------------------------------------------
@@ -305,33 +286,44 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
 app = ClientApp()
 
 
-@app.query("generate_embeddings")
-def generate_embeddings(msg: Message, context: Context) -> Message:
+@app.query("send_embeddings")
+def send_embeddings(msg: Message, context: Context) -> Message:
     """
-    Handle an embedding request from the server.
+    Stage A handler: return all embeddings for the requested split in one message.
 
-    Selects the correct feature matrix based on the view parameter:
-      view=0 uses X1 (active silo features)
-      view=1 uses X2 (passive silo features)
-    Applies the corresponding frozen encoder and returns the resulting
-    embeddings for the requested batch of sample indices.
-    No gradients are computed or stored during this operation.
+    Called once per split by the server during Stage A. Applies the frozen
+    encoder to the full split and returns the complete embedding matrix.
+    This one-time transfer eliminates repeated embedding requests during
+    Stage B, making the total communication cost equal to one forward pass
+    per sample — matching the theoretical protocol cost in the paper.
     """
-    desired_role = str(msg.content["config"].get("role", "")).strip().lower()
-    _init_if_needed(context, desired_role)
+    role  = str(msg.content["config"].get("role",  "")).strip().lower()
+    split = str(msg.content["config"].get("split", "train")).strip().lower()
+
+    _init_if_needed(context, role)
     cache = _get_cache(context)
+    dev   = cache["dev"]
+    idx   = _get_split_indices(cache, split)
 
-    view      = int(msg.content["config"].get("view", 0))
-    X         = cache["X1"] if view == 0 else cache["X2"]
-    batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
-    idx_t     = torch.from_numpy(batch_idx).long().to(X.device)
-    model     = cache["model_for_view0"] if view == 0 else cache["model_for_view1"]
+    if role == "active":
+        X     = cache["X1"].to(dev)
+        model = cache["model_active"]
+    elif role == "passive":
+        X     = cache["X2"].to(dev)
+        model = cache["model_passive"]
+    else:
+        raise RuntimeError(f"send_embeddings: unexpected role={role}")
 
     with torch.no_grad():
-        emb = model(X.index_select(0, idx_t)).detach().cpu().numpy().astype(np.float32)
+        emb = model(
+            X.index_select(0, idx.to(dev))
+        ).detach().cpu().numpy().astype(np.float32)
 
     return Message(
-        content=RecordDict({"arrays": ArrayRecord({"embedding": Array(emb)})}),
+        content=RecordDict({
+            "arrays": ArrayRecord({"embeddings": Array(emb)}),
+            "config": _cfg({"n_samples": len(emb), "split": split}),
+        }),
         reply_to=msg,
     )
 
@@ -339,27 +331,30 @@ def generate_embeddings(msg: Message, context: Context) -> Message:
 @app.query("get_labels")
 def get_labels(msg: Message, context: Context) -> Message:
     """
-    Handle a label request from the server.
+    Stage A handler: return all labels for the requested split.
 
-    Only the active silo is permitted to respond to label requests.
-    Raises a RuntimeError if called on a passive node, which would
-    indicate a role mismatch in the server logic.
+    Only the active silo responds to label requests. Called once per split
+    during Stage A. The passive silo has no access to labels at any point.
     """
-    desired_role = str(msg.content["config"].get("role", "")).strip().lower()
-    _init_if_needed(context, desired_role)
-    cache = _get_cache(context)
+    role  = str(msg.content["config"].get("role",  "")).strip().lower()
+    split = str(msg.content["config"].get("split", "train")).strip().lower()
 
-    if desired_role != "active":
+    _init_if_needed(context, role)
+
+    if role != "active":
         raise RuntimeError("get_labels called on non-active node (role mismatch).")
 
-    y         = cache["y"]
-    batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
-    idx_t     = torch.from_numpy(batch_idx).long().to(y.device)
+    cache = _get_cache(context)
+    idx   = _get_split_indices(cache, split)
+    y     = cache["y"]
 
     with torch.no_grad():
-        yb = y.index_select(0, idx_t).detach().cpu().numpy().astype(np.int64)
+        yb = y.index_select(0, idx).numpy().astype(np.int64)
 
     return Message(
-        content=RecordDict({"arrays": ArrayRecord({"y": Array(yb)})}),
+        content=RecordDict({
+            "arrays": ArrayRecord({"y": Array(yb)}),
+            "config": _cfg({"n_samples": len(yb), "split": split}),
+        }),
         reply_to=msg,
     )
