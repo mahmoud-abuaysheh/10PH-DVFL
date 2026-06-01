@@ -54,12 +54,12 @@ Both silos standardize features using training-fold means and standard deviation
 | Condition | Description | Tier 1 (Pre-training) | Tier 2 (VFL) |
 |-----------|-------------|----------------------|--------------|
 | 1 — SplitNN | Standard online VFL baseline (gradient passing) | — | `serverapp_vfl_glioma_splitnn.py` + `clientapp_vfl_glioma_splitnn.py` |
-| 2 — Decoupled VFL (SUP + DAE) | Active: supervised pre-training. Passive: standalone DAE | `pretrain_active_supervised.py` + `run_passive_ssl_pretrain_local.py` | `serverapp_vfl_glioma_router.py` + `clientapp_vfl_glioma_router_client_both_ssl.py` |
-| 3 — Decoupled VFL (DAE + DAE) | Both silos: standalone DAE pre-training (fully label-free) | `run_active_ssl_pretrain_local.py` + `run_passive_ssl_pretrain_local.py` | `serverapp_vfl_glioma_router.py` + `clientapp_vfl_glioma_router_client_both_ssl.py` |
-| 4 — Decoupled VFL (HFL passive) | Passive silo: federated HFL DAE pre-training (K=10 or K=20) | `serverapp_hfl_passive_glioma.py` + `clientapp_hfl_passive_glioma.py` | `serverapp_vfl_glioma_router.py` + `clientapp_vfl_glioma_router_client_both_ssl.py` |
+| 2 — Decoupled VFL (SUP + DAE) | Active: supervised pre-training. Passive: standalone DAE | `pretrain_active_supervised.py` + `run_passive_ssl_pretrain_local.py` | `serverapp_vfl_glioma_decoupled.py` + `clientapp_vfl_glioma_decoupled.py` |
+| 3 — Decoupled VFL (DAE + DAE) | Both silos: standalone DAE pre-training (fully label-free) | `run_active_ssl_pretrain_local.py` + `run_passive_ssl_pretrain_local.py` | `serverapp_vfl_glioma_decoupled.py` + `clientapp_vfl_glioma_decoupled.py` |
+| 4 — Decoupled VFL (HFL passive) | Passive silo: federated HFL DAE pre-training (K=10 or K=20) | `serverapp_hfl_passive_glioma.py` + `clientapp_hfl_passive_glioma.py` | `serverapp_vfl_glioma_decoupled.py` + `clientapp_vfl_glioma_decoupled.py` |
 | 5 — Centralized | Upper bound: full joint feature space, no federation | — | `train_centralized_glioma.py` |
 
-> **Note:** Conditions 2, 3, and 4 all share the same Tier 2 client and server scripts (`clientapp_vfl_glioma_router_client_both_ssl.py` and `serverapp_vfl_glioma_router.py`). The difference between conditions lies in which pre-trained checkpoints are loaded at Tier 2 initialisation.
+> **Note:** Conditions 2, 3, and 4 all share the same Tier 2 client and server scripts (`clientapp_vfl_glioma_decoupled.py` and `serverapp_vfl_glioma_decoupled.py`). The difference between conditions lies in which pre-trained checkpoints are loaded at Tier 2 initialisation.
 
 
 ---
@@ -173,8 +173,8 @@ After each fold completes, the HFL server saves:
 | `clientapp_hfl_passive_glioma.py` | Flower HFL client for passive silo pre-training (Condition 4) |
 | `serverapp_vfl_glioma_splitnn.py` | Flower VFL server — SplitNN baseline (Condition 1) |
 | `clientapp_vfl_glioma_splitnn.py` | Flower VFL client — SplitNN baseline (Condition 1) |
-| `serverapp_vfl_glioma_router.py` | Flower VFL server — Decoupled architecture (Conditions 2, 3, 4) |
-| `clientapp_vfl_glioma_router_client_both_ssl.py` | Flower VFL client — Decoupled architecture (Conditions 2, 3, 4) |
+| `serverapp_vfl_glioma_decoupled.py` | Flower VFL server — Decoupled architecture (Conditions 2, 3, 4) |
+| `clientapp_vfl_glioma_decoupled.py` | Flower VFL client — Decoupled architecture (Conditions 2, 3, 4) |
 | `pyproject.toml` | Flower app configuration template |
 
 ---
