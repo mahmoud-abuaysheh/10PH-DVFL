@@ -6,19 +6,25 @@
 # silos in Tier 2 of the 10PH-DVFL architecture, and optionally supports
 # intra-silo HFL pre-training for the passive silo in Tier 1.
 #
+# Two-stage protocol:
+#   Stage A — send_embeddings handler:
+#     Called once per split (train/val/test) by the server. Returns the full
+#     embedding matrix for the requested split in a single message. Since
+#     encoders are frozen after Tier 1, embeddings are identical for every
+#     training round. Sending them once eliminates repeated cross-silo
+#     communication during Stage B.
+#   Stage B — no handlers called:
+#     The server trains the fusion head entirely on cached embeddings.
+#     No messages are sent to any client node during Stage B.
+#
 # Roles handled by this client:
 #   "active"      : Loads the pre-trained active-silo encoder. Responds to
-#                   embedding requests using X1 and label requests using y.
-#                   The active silo is the only party with access to labels.
-#   "passive"     : Loads the pre-trained passive-silo encoder (from local SSL
-#                   or HFL pre-training). Responds to embedding requests using X2.
-#                   The passive silo has no access to labels at any point.
+#                   send_embeddings requests using X1 and get_labels requests
+#                   using y for the requested split.
+#   "passive"     : Loads the pre-trained passive-silo encoder. Responds to
+#                   send_embeddings requests using X2.
 #   "passive_hfl" : Initialises a randomly initialised passive encoder and
-#                   trains it locally through the hfl_fit handler using a
-#                   self-supervised two-view augmentation objective.
-#
-# All encoders are frozen after Tier 1 pre-training. During Tier 2, clients
-# only serve pre-computed embeddings; no gradients are received from the server.
+#                   trains it locally through the hfl_fit handler.
 
 from __future__ import annotations
 
@@ -34,10 +40,13 @@ import torch.nn as nn
 from flwr.app import Array, ArrayRecord, ConfigRecord, Context, Message, RecordDict
 from flwr.clientapp import ClientApp
 
-# Module-level cache to persist loaded data and models across handler calls
-# within the same client process, avoiding repeated disk reads.
+# Module-level cache to persist loaded data and models across handler calls.
 _CACHE: Dict[str, Dict] = {}
 
+
+# ---------------------------------------------------------------------------
+# Cache utilities
+# ---------------------------------------------------------------------------
 
 def _cache_key(context: Context) -> str:
     """Return a unique string key identifying this client node."""
@@ -53,12 +62,20 @@ def _get_cache(context: Context) -> Dict:
     return _CACHE[k]
 
 
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
 def set_seed(seed: int) -> None:
     """Fix all random seeds for reproducibility across numpy, torch, and CUDA."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
+# ---------------------------------------------------------------------------
+# Model definition
+# ---------------------------------------------------------------------------
 
 class BottomMLP_Paper(nn.Module):
     """
@@ -81,18 +98,21 @@ class BottomMLP_Paper(nn.Module):
         return self.net(x)
 
 
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
 def load_npz(npz_path: str):
     """
     Load the pre-computed cross-validation dataset from the NPZ file.
     Returns feature matrices X1 and X2, labels y, fold splits, and metadata.
-    X1 contains active-silo features; X2 contains passive-silo features.
     """
-    d = np.load(npz_path, allow_pickle=True)
-    X1 = d["X1"].astype(np.float32)
-    X2 = d["X2"].astype(np.float32)
-    y = d["y"].astype(np.int64)
+    d     = np.load(npz_path, allow_pickle=True)
+    X1    = d["X1"].astype(np.float32)
+    X2    = d["X2"].astype(np.float32)
+    y     = d["y"].astype(np.int64)
     folds = list(d["folds"])
-    meta = json.loads(str(d["meta"])) if "meta" in d.files else {}
+    meta  = json.loads(str(d["meta"])) if "meta" in d.files else {}
     return X1, X2, y, folds, meta
 
 
@@ -106,6 +126,10 @@ def _standardize_using_train(X: np.ndarray, tr_idx: np.ndarray) -> np.ndarray:
     return (X - mu) / sd
 
 
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
 def _cfg(d: Dict[str, object] | None = None) -> ConfigRecord:
     """Wrap a plain dict as a Flower ConfigRecord."""
     return ConfigRecord(d or {})
@@ -114,15 +138,10 @@ def _cfg(d: Dict[str, object] | None = None) -> ConfigRecord:
 def _unwrap_state_dict(state: object) -> Dict[str, torch.Tensor]:
     """
     Extract the encoder state dict from a checkpoint file.
-
-    Supports multiple checkpoint formats by checking for common key names
-    ('bottom_state', 'model_state', 'state_dict', 'model') before falling
-    back to treating the entire dict as a state dict. Also handles DataParallel
-    checkpoints by stripping 'module.' prefixes from parameter names.
+    Supports multiple checkpoint formats and handles DataParallel checkpoints.
     """
     if not isinstance(state, dict):
         raise RuntimeError(f"Checkpoint is not a dict; got type={type(state)}")
-
     if "bottom_state" in state and isinstance(state["bottom_state"], dict):
         sd = state["bottom_state"]
     elif "model_state" in state and isinstance(state["model_state"], dict):
@@ -133,100 +152,93 @@ def _unwrap_state_dict(state: object) -> Dict[str, torch.Tensor]:
         sd = state["model"]
     else:
         sd = state
-
     if any(k.startswith("module.") for k in sd.keys()):
         sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
-
     return sd
 
 
-def _state_dict_to_arrays(sd: Dict[str, torch.Tensor]) -> Dict[str, Array]:
+def _state_dict_to_arrays(
+    sd: Dict[str, torch.Tensor]
+) -> Dict[str, Array]:
     """Convert a PyTorch state dict to a dict of Flower Arrays for transmission."""
-    return {k: Array(v.detach().cpu().numpy().astype(np.float32)) for k, v in sd.items()}
+    return {
+        k: Array(v.detach().cpu().numpy().astype(np.float32))
+        for k, v in sd.items()
+    }
 
 
-def _arrays_to_state_dict(arrs: Dict[str, Array], device: torch.device) -> Dict[str, torch.Tensor]:
-    """Convert a dict of Flower Arrays back to a PyTorch state dict on the given device."""
-    return {k: torch.from_numpy(arr.numpy()).to(device) for k, arr in arrs.items()}
+def _arrays_to_state_dict(
+    arrs: Dict[str, Array], device: torch.device
+) -> Dict[str, torch.Tensor]:
+    """Convert a dict of Flower Arrays back to a PyTorch state dict."""
+    return {
+        k: torch.from_numpy(arr.numpy()).to(device)
+        for k, arr in arrs.items()
+    }
 
 
 def _two_view_augment(
     x: torch.Tensor, noise_std: float = 0.05, dropout_p: float = 0.1
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Create two augmented tabular views of the same input batch for
-    self-supervised contrastive pre-training.
-
-    Each view is independently augmented using:
-      - Gaussian noise addition (controlled by noise_std)
-      - Random feature dropout masking (controlled by dropout_p)
-    The encoder is trained to produce similar representations for both views
-    of the same sample, encouraging it to learn robust features.
+    Create two augmented tabular views for self-supervised HFL pre-training.
+    Each view is independently augmented with Gaussian noise and feature dropout.
     """
     def aug(t: torch.Tensor) -> torch.Tensor:
         if noise_std > 0:
             t = t + noise_std * torch.randn_like(t)
         if dropout_p > 0:
             mask = (torch.rand_like(t) > dropout_p).float()
-            t = t * mask
+            t    = t * mask
         return t
     return aug(x), aug(x)
 
 
-def _neg_cos_sim(z1: torch.Tensor, z2: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def _neg_cos_sim(
+    z1: torch.Tensor, z2: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
     """
-    Compute the negative cosine similarity between two embedding tensors.
-    Used as the self-supervised loss during HFL passive encoder pre-training.
-    Minimising this loss encourages the encoder to produce similar embeddings
-    for different augmented views of the same sample.
+    Negative cosine similarity used as the self-supervised HFL pre-training loss.
     """
     z1 = z1 / (z1.norm(dim=1, keepdim=True) + eps)
     z2 = z2 / (z2.norm(dim=1, keepdim=True) + eps)
     return 1.0 - (z1 * z2).sum(dim=1).mean()
 
 
+# ---------------------------------------------------------------------------
+# Initialisation
+# ---------------------------------------------------------------------------
+
 def _init_if_needed(context: Context, desired_role: str) -> None:
     """
     Initialise the client node for the role requested by the server.
 
-    This function is called at the start of each handler and is a no-op
-    if the client has already been initialised for the requested role.
-    Initialisation loads the dataset, applies fold-specific standardization,
-    and loads the appropriate pre-trained encoder checkpoint.
+    Called at the start of each handler. Is a no-op if the client has already
+    been initialised for the requested role. Loads the dataset, applies
+    fold-specific standardization, and loads the appropriate encoder checkpoint.
 
-    Checkpoint loading logic:
-      active      : loads pretrained_active_sup_fold{fold}.pt or
-                    pretrained_active_bottom_ssl_fold{fold}.pt depending
-                    on which pre-training mode was used
-      passive     : loads pretrained_passive_bottom_hfl_fold{fold}.pt if
-                    available (HFL pre-training), otherwise falls back to
-                    pretrained_passive_bottom_ssl_fold{fold}.pt (local SSL)
-      passive_hfl : initialises a randomly initialised encoder for HFL training
+    Checkpoint priority:
+      active  : supervised checkpoint takes priority over SSL checkpoint
+      passive : HFL checkpoint takes priority over local SSL checkpoint
     """
     cache = _get_cache(context)
-    key = f"ready::{desired_role}"
+    key   = f"ready::{desired_role}"
     if cache.get(key, False):
         return
 
-    run = context.run_config
-
+    run    = context.run_config
     DEFAULT_NPZ = Path(__file__).resolve().parent / "diabetes_vfl_cv.npz"
-    npz = str(run.get("npz", str(DEFAULT_NPZ)))
-    fold = int(os.environ.get("FOLD", run.get("fold", 1)))
-
-    seed = int(run.get("seed", 42))
+    npz    = str(run.get("npz", str(DEFAULT_NPZ)))
+    fold   = int(os.environ.get("FOLD", run.get("fold", 1)))
+    seed   = int(run.get("seed", 42))
     device = str(run.get("device", "cpu"))
 
-    # Read checkpoint directories from the Flower run configuration.
-    active_dir = str(run.get("active_ckpt_dir", "./runs_active_ssl_diabetes"))
+    active_dir  = str(run.get("active_ckpt_dir",  "./runs_active_ssl_diabetes"))
     passive_dir = str(run.get("passive_ckpt_dir", "./runs_passive_ssl_diabetes"))
 
-    # Active encoder checkpoint: supervised pre-training takes priority over SSL.
-    active_ckpt_sup = os.path.join(active_dir, f"pretrained_active_sup_fold{fold}.pt")
-    active_ckpt_ssl = os.path.join(active_dir, f"pretrained_active_bottom_ssl_fold{fold}.pt")
-
-    # Passive encoder checkpoint: HFL pre-training takes priority over local SSL.
-    passive_ckpt_hfl = os.path.join(passive_dir, f"pretrained_passive_bottom_hfl_fold{fold}.pt")
+    active_ckpt_sup   = os.path.join(active_dir,  f"pretrained_active_sup_fold{fold}.pt")
+    active_ckpt_ssl   = os.path.join(active_dir,  f"pretrained_active_bottom_ssl_fold{fold}.pt")
+    passive_ckpt_hfl  = os.path.join(passive_dir, f"pretrained_passive_bottom_hfl_fold{fold}.pt")
     passive_ckpt_local = os.path.join(passive_dir, f"pretrained_passive_bottom_ssl_fold{fold}.pt")
 
     set_seed(seed)
@@ -234,76 +246,78 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
 
     X1, X2, y, folds, meta = load_npz(npz)
     split_obj = folds[fold - 1]
-    split = split_obj.item() if hasattr(split_obj, "item") else split_obj
-    tr = split["train"].astype(np.int64)
+    split_    = split_obj.item() if hasattr(split_obj, "item") else split_obj
+    tr = split_["train"].astype(np.int64)
+    va = split_["val"].astype(np.int64)
+    te = split_["test"].astype(np.int64)
 
-    # Standardize features using training split statistics only.
+    # Standardize using training split statistics only.
     X1s = _standardize_using_train(X1, tr)
     X2s = _standardize_using_train(X2, tr)
 
-    cache["dev"] = dev
+    cache["dev"]  = dev
     cache["meta"] = meta
     cache["fold"] = fold
-    cache["X1"] = torch.from_numpy(X1s).float().to(dev)
-    cache["X2"] = torch.from_numpy(X2s).float().to(dev)
-    cache["y"] = torch.from_numpy(y).long().to(dev)
+    cache["tr"]   = tr
+    cache["va"]   = va
+    cache["te"]   = te
 
-    m0 = BottomMLP_Paper(in_dim=int(cache["X1"].shape[1])).to(dev)
-    m1 = BottomMLP_Paper(in_dim=int(cache["X2"].shape[1])).to(dev)
+    # Store full standardized feature matrices for all splits.
+    # Stage A requests embeddings for the full split at once.
+    cache["X1"] = torch.from_numpy(X1s).float()
+    cache["X2"] = torch.from_numpy(X2s).float()
+    cache["y"]  = torch.from_numpy(y).long()
+
+    m0 = BottomMLP_Paper(in_dim=int(X1.shape[1])).to(dev)
+    m1 = BottomMLP_Paper(in_dim=int(X2.shape[1])).to(dev)
 
     if desired_role == "active":
-        # Load the active-silo encoder. Supervised pre-training checkpoint
-        # takes priority; falls back to SSL checkpoint if not found.
         if os.path.exists(active_ckpt_sup):
             ckpt_path = active_ckpt_sup
         elif os.path.exists(active_ckpt_ssl):
             ckpt_path = active_ckpt_ssl
         else:
             raise FileNotFoundError(
-                f"[ACTIVE] No checkpoint found. Tried:\n  {active_ckpt_sup}\n  {active_ckpt_ssl}"
+                f"[ACTIVE] No checkpoint found. Tried:\n"
+                f"  {active_ckpt_sup}\n  {active_ckpt_ssl}"
             )
         state = torch.load(ckpt_path, map_location=dev)
-        sd = _unwrap_state_dict(state)
+        sd    = _unwrap_state_dict(state)
         m0.load_state_dict(sd, strict=True)
-        cache["model_for_view0"] = m0
-        cache["model_for_view1"] = m1  # Not used by the active role.
+        cache["model_active"]  = m0
+        cache["model_passive"] = m1
         print(f"[Client init][ACTIVE] loaded {ckpt_path}")
 
     elif desired_role == "passive":
-        # Load the passive-silo encoder. HFL checkpoint takes priority
-        # over local SSL checkpoint if both are present.
         if os.path.exists(passive_ckpt_hfl):
             ckpt_path = passive_ckpt_hfl
         elif os.path.exists(passive_ckpt_local):
             ckpt_path = passive_ckpt_local
         else:
             raise FileNotFoundError(
-                f"[PASSIVE] No checkpoint found. Tried:\n  {passive_ckpt_hfl}\n  {passive_ckpt_local}"
+                f"[PASSIVE] No checkpoint found. Tried:\n"
+                f"  {passive_ckpt_hfl}\n  {passive_ckpt_local}"
             )
         state = torch.load(ckpt_path, map_location=dev)
-        sd = _unwrap_state_dict(state)
+        sd    = _unwrap_state_dict(state)
         m1.load_state_dict(sd, strict=True)
-        cache["model_for_view0"] = m0  # Not used by the passive role.
-        cache["model_for_view1"] = m1
+        cache["model_active"]  = m0
+        cache["model_passive"] = m1
         print(f"[Client init][PASSIVE] loaded {ckpt_path}")
 
     elif desired_role == "passive_hfl":
-        # Initialise a randomly initialised passive encoder for HFL pre-training.
-        # Weights will be replaced by the global model sent by the server
-        # at the start of each HFL round.
-        cache["model_for_view0"] = m0  # Not used by the passive HFL role.
-        cache["model_for_view1"] = m1  # Trainable passive encoder.
-        for p in cache["model_for_view1"].parameters():
+        cache["model_active"]  = m0
+        cache["model_passive"] = m1
+        for p in cache["model_passive"].parameters():
             p.requires_grad_(True)
-        cache["model_for_view1"].train()
-        print("[Client init][PASSIVE_HFL] initialized random bottom (will be trained via HFL)")
+        cache["model_passive"].train()
+        print("[Client init][PASSIVE_HFL] initialized random bottom")
     else:
         raise RuntimeError(f"Unknown desired_role={desired_role}")
 
-    # Freeze all encoder parameters after Tier 1 pre-training.
-    # Encoders are never updated during Tier 2 fusion head training.
+    # Freeze encoders after Tier 1 pre-training.
     if desired_role != "passive_hfl":
-        for m in (cache["model_for_view0"], cache["model_for_view1"]):
+        for m in (cache["model_active"], cache["model_passive"]):
             for p in m.parameters():
                 p.requires_grad_(False)
             m.eval()
@@ -315,154 +329,188 @@ def _init_if_needed(context: Context, desired_role: str) -> None:
     )
 
 
+def _get_split_indices(cache: Dict, split: str) -> torch.Tensor:
+    """Return the index tensor for the requested split name."""
+    if split == "train":
+        return torch.from_numpy(cache["tr"]).long()
+    elif split == "val":
+        return torch.from_numpy(cache["va"]).long()
+    elif split == "test":
+        return torch.from_numpy(cache["te"]).long()
+    else:
+        raise ValueError(f"Unknown split: {split}")
+
+
+# ---------------------------------------------------------------------------
+# Flower ClientApp and handlers
+# ---------------------------------------------------------------------------
+
 app = ClientApp()
 
 
-@app.query("generate_embeddings")
-def generate_embeddings(msg: Message, context: Context) -> Message:
+@app.query("send_embeddings")
+def send_embeddings(msg: Message, context: Context) -> Message:
     """
-    Handle an embedding request from the server.
+    Stage A handler: return all embeddings for the requested split in one message.
 
-    Selects the correct feature matrix based on the view parameter:
-      view=0 uses X1 (active silo features)
-      view=1 uses X2 (passive silo features)
-    Applies the corresponding frozen encoder and returns the resulting
-    embeddings for the requested batch of sample indices.
-    No gradients are computed or stored during this operation.
+    Called once per split (train/val/test) by the server during Stage A.
+    Applies the frozen encoder to the full split and returns the complete
+    embedding matrix. This eliminates the need for repeated per-batch
+    embedding requests during Stage B fusion head training.
+
+    The communication cost of this one-time transfer equals exactly one
+    forward pass per sample — matching the theoretical protocol cost.
     """
-    desired_role = str(msg.content["config"].get("role", "")).strip().lower()
-    _init_if_needed(context, desired_role)
+    role  = str(msg.content["config"].get("role",  "")).strip().lower()
+    split = str(msg.content["config"].get("split", "train")).strip().lower()
+
+    _init_if_needed(context, role)
     cache = _get_cache(context)
+    dev   = cache["dev"]
 
-    view = int(msg.content["config"].get("view", 0))
-    X = cache["X1"] if view == 0 else cache["X2"]
+    idx = _get_split_indices(cache, split)
 
-    batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
-    idx_t = torch.from_numpy(batch_idx).long().to(X.device)
+    if role == "active":
+        X     = cache["X1"].to(dev)
+        model = cache["model_active"]
+    elif role == "passive":
+        X     = cache["X2"].to(dev)
+        model = cache["model_passive"]
+    else:
+        raise RuntimeError(f"send_embeddings: unexpected role={role}")
 
-    model = cache["model_for_view0"] if view == 0 else cache["model_for_view1"]
+    # Generate embeddings for the full split in one forward pass.
+    # Encoders are frozen so no gradients are needed.
     with torch.no_grad():
-        emb = model(X.index_select(0, idx_t)).detach().cpu().numpy().astype(np.float32)
+        emb = model(X.index_select(0, idx.to(dev))).detach().cpu().numpy().astype(np.float32)
 
-    arrs = ArrayRecord({"embedding": Array(emb)})
-    return Message(content=RecordDict({"arrays": arrs}), reply_to=msg)
+    return Message(
+        content=RecordDict({
+            "arrays": ArrayRecord({"embeddings": Array(emb)}),
+            "config": _cfg({"n_samples": len(emb), "split": split}),
+        }),
+        reply_to=msg,
+    )
 
 
 @app.query("get_labels")
 def get_labels(msg: Message, context: Context) -> Message:
     """
-    Handle a label request from the server.
+    Stage A handler: return all labels for the requested split.
 
-    Only the active silo is permitted to respond to label requests.
-    Raises a RuntimeError if this handler is called on a passive node,
-    which would indicate a role mismatch in the server logic.
+    Called once per split by the server during Stage A to retrieve labels
+    from the active silo. The passive silo has no access to labels at any point.
     """
-    desired_role = str(msg.content["config"].get("role", "")).strip().lower()
-    _init_if_needed(context, desired_role)
-    cache = _get_cache(context)
+    role  = str(msg.content["config"].get("role",  "")).strip().lower()
+    split = str(msg.content["config"].get("split", "train")).strip().lower()
 
-    if desired_role != "active":
+    _init_if_needed(context, role)
+
+    if role != "active":
         raise RuntimeError("get_labels called on non-active node (role mismatch).")
 
-    y = cache["y"]
-    batch_idx = msg.content["arrays"]["batch_idx"].numpy().astype(np.int64)
-    idx_t = torch.from_numpy(batch_idx).long().to(y.device)
+    cache = _get_cache(context)
+    idx   = _get_split_indices(cache, split)
+    y     = cache["y"]
 
     with torch.no_grad():
-        yb = y.index_select(0, idx_t).detach().cpu().numpy().astype(np.int64)
+        yb = y.index_select(0, idx).numpy().astype(np.int64)
 
-    arrs = ArrayRecord({"y": Array(yb)})
-    return Message(content=RecordDict({"arrays": arrs}), reply_to=msg)
+    return Message(
+        content=RecordDict({
+            "arrays": ArrayRecord({"y": Array(yb)}),
+            "config": _cfg({"n_samples": len(yb), "split": split}),
+        }),
+        reply_to=msg,
+    )
 
 
 @app.query("hfl_fit")
 def hfl_fit(msg: Message, context: Context) -> Message:
     """
-    Handle one local HFL training round for passive-silo self-supervised pre-training.
+    Handle one local HFL training round for passive-silo self-supervised
+    pre-training (Tier 1 optional stage).
 
-    This handler implements the client-side step of the intra-silo HFL stage
-    (Tier 1, optional) in the 10PH-DVFL architecture. It is called once per
-    HFL round by the server during passive encoder pre-training.
-
-    Each call:
-      1. Loads the current global passive encoder weights sent by the server
-      2. Trains the encoder locally on the client's assigned data partition
-         using a self-supervised two-view cosine similarity objective
-      3. Returns the locally updated weights, the number of local examples,
-         and the average training loss to the server for FedAvg aggregation
-
-    The passive encoder is trained without access to any labels. The
-    self-supervised objective encourages the encoder to produce consistent
-    representations for different augmented views of the same tabular sample.
+    Receives global encoder weights, trains locally on the assigned partition
+    using two-view cosine similarity, and returns updated weights.
     """
-    cfg = msg.content["config"]
+    cfg          = msg.content["config"]
     desired_role = str(cfg.get("role", "")).strip().lower()
     if desired_role != "passive_hfl":
-        raise RuntimeError(f"hfl_fit called with role={desired_role}, expected passive_hfl")
+        raise RuntimeError(
+            f"hfl_fit called with role={desired_role}, expected passive_hfl"
+        )
 
     _init_if_needed(context, desired_role)
     cache = _get_cache(context)
-    dev: torch.device = cache["dev"]
+    dev   = cache["dev"]
 
-    # Determine this client's local partition using its rank within the K clients.
     client_rank = int(cfg.get("client_rank", 0))
-    K = int(cfg.get("K", 1))
-    X2: torch.Tensor = cache["X2"]
-    fold = int(os.environ.get("FOLD", context.run_config.get("fold", 1)))
+    K           = int(cfg.get("K", 1))
+    X2          = cache["X2"].to(dev)
+    fold        = int(os.environ.get("FOLD", context.run_config.get("fold", 1)))
 
-    # Reload fold metadata to reconstruct the training partition for this client.
-    run = context.run_config
+    run         = context.run_config
     DEFAULT_NPZ = Path(__file__).resolve().parent / "diabetes_vfl_cv.npz"
-    npz = str(run.get("npz", str(DEFAULT_NPZ)))
+    npz         = str(run.get("npz", str(DEFAULT_NPZ)))
     _, _, _, folds, _ = load_npz(npz)
-    split_obj = folds[fold - 1]
-    split = split_obj.item() if hasattr(split_obj, "item") else split_obj
-    tr = split["train"].astype(np.int64)
+    split_obj   = folds[fold - 1]
+    split_      = split_obj.item() if hasattr(split_obj, "item") else split_obj
+    tr          = split_["train"].astype(np.int64)
 
     parts = np.array_split(tr, K)
     if client_rank < 0 or client_rank >= len(parts):
-        raise RuntimeError(f"client_rank={client_rank} out of range for K={K}")
+        raise RuntimeError(
+            f"client_rank={client_rank} out of range for K={K}"
+        )
     local_idx = parts[client_rank].astype(np.int64)
 
-    model: nn.Module = cache["model_for_view1"]
+    model = cache["model_passive"]
     model.to(dev)
 
-    # Replace local encoder weights with the current global weights from the server.
     if "arrays" in msg.content and "global_weights" in msg.content["arrays"]:
         gw = msg.content["arrays"]["global_weights"]
         sd = _arrays_to_state_dict(gw, dev)
         model.load_state_dict(sd, strict=True)
 
-    lr = float(cfg.get("lr", 1e-3))
+    lr           = float(cfg.get("lr", 1e-3))
     local_epochs = int(cfg.get("local_epochs", 1))
-    batch = int(cfg.get("batch", 256))
-    noise_std = float(cfg.get("noise_std", 0.05))
-    dropout_p = float(cfg.get("dropout_p", 0.1))
+    batch        = int(cfg.get("batch", 256))
+    noise_std    = float(cfg.get("noise_std", 0.05))
+    dropout_p    = float(cfg.get("dropout_p", 0.1))
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    # Local self-supervised training using two augmented views of each sample.
-    n = len(local_idx)
+    n      = len(local_idx)
     model.train()
     losses = []
+
     for _ in range(local_epochs):
         perm = np.random.permutation(n)
         for start in range(0, n, batch):
-            idx = local_idx[perm[start:start + batch]]
-            xb = X2.index_select(0, torch.from_numpy(idx).long().to(dev))
+            idx = local_idx[perm[start : start + batch]]
+            xb  = X2.index_select(
+                0, torch.from_numpy(idx).long().to(dev)
+            )
             x1, x2 = _two_view_augment(xb, noise_std=noise_std, dropout_p=dropout_p)
-            z1 = model(x1)
-            z2 = model(x2)
-            loss = _neg_cos_sim(z1, z2)
+            loss    = _neg_cos_sim(model(x1), model(x2))
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             losses.append(float(loss.detach().cpu().item()))
 
-    avg_loss = float(np.mean(losses)) if losses else 0.0
-
-    # Return updated encoder weights to the server for FedAvg aggregation.
-    out_sd = model.state_dict()
-    out_arrs = ArrayRecord({"global_weights": _state_dict_to_arrays(out_sd)})
-    out_cfg = _cfg({"num_examples": int(n), "loss": avg_loss, "client_rank": client_rank, "K": K})
-    return Message(content=RecordDict({"arrays": out_arrs, "config": out_cfg}), reply_to=msg)
+    avg_loss  = float(np.mean(losses)) if losses else 0.0
+    out_sd    = model.state_dict()
+    out_arrs  = ArrayRecord({
+        "global_weights": _state_dict_to_arrays(out_sd)
+    })
+    out_cfg   = _cfg({
+        "num_examples": int(n),
+        "loss": avg_loss,
+        "client_rank": client_rank,
+        "K": K,
+    })
+    return Message(
+        content=RecordDict({"arrays": out_arrs, "config": out_cfg}),
+        reply_to=msg,
+    )
