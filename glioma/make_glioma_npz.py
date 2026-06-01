@@ -10,7 +10,6 @@
 #
 # Notes:
 # - Labels (y) are stored once in the NPZ (conceptually owned by the active party / server in simulation).
-# - No feature extraction is done here; bottom models stay fully trainable in training scripts.
 
 import argparse
 import numpy as np
