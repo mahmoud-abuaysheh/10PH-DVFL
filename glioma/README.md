@@ -53,7 +53,7 @@ Both silos standardize features using training-fold means and standard deviation
 
 | Condition | Description | Tier 1 (Pre-training) | Tier 2 (VFL) |
 |-----------|-------------|----------------------|--------------|
-| 1 — SplitNN | Standard online VFL baseline (immediate gradient passing) | — | `serverapp_vfl_glioma_immediate.py` + `clientapp_vfl_glioma_immediate.py` |
+| 1 — SplitNN | Standard online VFL baseline (gradient passing) | — | `serverapp_vfl_glioma_splitnn.py` + `clientapp_vfl_glioma_splitnn.py` |
 | 2 — Decoupled VFL (SUP + DAE) | Active: supervised pre-training. Passive: standalone DAE | `pretrain_active_supervised.py` + `run_passive_ssl_pretrain_local.py` | `serverapp_vfl_glioma_router.py` + `clientapp_vfl_glioma_router_client_both_ssl.py` |
 | 3 — Decoupled VFL (DAE + DAE) | Both silos: standalone DAE pre-training (fully label-free) | `run_active_ssl_pretrain_local.py` + `run_passive_ssl_pretrain_local.py` | `serverapp_vfl_glioma_router.py` + `clientapp_vfl_glioma_router_client_both_ssl.py` |
 | 4 — Decoupled VFL (HFL passive) | Passive silo: federated HFL DAE pre-training (K=10 or K=20) | `serverapp_hfl_passive_glioma.py` + `clientapp_hfl_passive_glioma.py` | `serverapp_vfl_glioma_router.py` + `clientapp_vfl_glioma_router_client_both_ssl.py` |
@@ -61,7 +61,6 @@ Both silos standardize features using training-fold means and standard deviation
 
 > **Note:** Conditions 2, 3, and 4 all share the same Tier 2 client and server scripts (`clientapp_vfl_glioma_router_client_both_ssl.py` and `serverapp_vfl_glioma_router.py`). The difference between conditions lies in which pre-trained checkpoints are loaded at Tier 2 initialisation.
 
-> **Note:** In this codebase, "immediate" refers to the SplitNN baseline (immediate gradient passing). Scripts named `_immediate_` implement the SplitNN protocol.
 
 ---
 
@@ -109,8 +108,8 @@ In `pyproject.toml`, replace `YOUR_SERVER_SCRIPT` and `YOUR_CLIENT_SCRIPT` with 
 
 ```toml
 [tool.flwr.app.components]
-serverapp = "serverapp_vfl_glioma_immediate:app"
-clientapp = "clientapp_vfl_glioma_immediate:app"
+serverapp = "serverapp_vfl_glioma_splitnn:app"
+clientapp = "clientapp_vfl_glioma_splitnn:app"
 ```
 
 ### Step 4 — Run per fold
@@ -172,8 +171,8 @@ After each fold completes, the HFL server saves:
 | `run_passive_ssl_pretrain_local.py` | DAE pre-training for passive silo (Conditions 2, 3) |
 | `serverapp_hfl_passive_glioma.py` | Flower HFL server for passive silo pre-training (Condition 4). After FedAvg training completes, the server collects embeddings from each HFL client and saves a silo-level embedding matrix alongside the checkpoint. |
 | `clientapp_hfl_passive_glioma.py` | Flower HFL client for passive silo pre-training (Condition 4) |
-| `serverapp_vfl_glioma_immediate.py` | Flower VFL server — SplitNN baseline (Condition 1) |
-| `clientapp_vfl_glioma_immediate.py` | Flower VFL client — SplitNN baseline (Condition 1) |
+| `serverapp_vfl_glioma_splitnn.py` | Flower VFL server — SplitNN baseline (Condition 1) |
+| `clientapp_vfl_glioma_splitnn.py` | Flower VFL client — SplitNN baseline (Condition 1) |
 | `serverapp_vfl_glioma_router.py` | Flower VFL server — Decoupled architecture (Conditions 2, 3, 4) |
 | `clientapp_vfl_glioma_router_client_both_ssl.py` | Flower VFL client — Decoupled architecture (Conditions 2, 3, 4) |
 | `pyproject.toml` | Flower app configuration template |
