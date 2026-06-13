@@ -99,16 +99,16 @@ python generate_midas_fold_npz.py \
 
 All conditions use fixed seed=42 and 5-fold stratified cross-validation.
 
-| Stage | Epochs/Rounds | Batch Size | Optimizer | Learning Rate |
-|-------|--------------|------------|-----------|---------------|
-| BYOL pre-training — all silos (Condition 2) | 100 epochs | 64 | AdamW | 3×10⁻⁴ |
-| Supervised active pre-training (Condition 3) | 100 epochs | 64 | AdamW | 1×10⁻⁴ |
-| Decoupled Tier 2 — frozen encoders (Conditions 2, 3) | 100 rounds | 64 | Adam | 1×10⁻³ |
-| SplitNN (Condition 1) | 100 rounds | 64 | AdamW | 1×10⁻⁴ |
-| Centralized (Condition 4) | 100 epochs | 64 | AdamW | 1×10⁻⁴ |
+| Stage | Epochs/Rounds | Batch Size | Optimizer | Learning Rate | Early Stopping |
+|-------|--------------|------------|-----------|---------------|----------------|
+| BYOL pre-training — all silos (Condition 2) | 20 epochs | 64 | AdamW | 3×10⁻⁴ | No — fixed schedule, final checkpoint used |
+| Supervised active pre-training (Condition 3) | 20 epochs | 64 | AdamW | 1×10⁻⁴ | Yes — patience=7 |
+| Decoupled Tier 2 — frozen encoders (Conditions 2, 3) | 20 rounds | 64 | Adam | 1×10⁻³ | Yes — patience=7 |
+| SplitNN (Condition 1) | 20 rounds | 64 | AdamW | 1×10⁻⁴ | Yes — patience=7 |
+| Centralized (Condition 4) | 20 epochs | 64 | AdamW | 1×10⁻⁴ | Yes — patience=7 |
 
 **Additional settings:**
-- BYOL: exponential moving average τ annealed 0.996→1.0, cosine annealing schedule
+- BYOL: exponential moving average τ annealed 0.996→1.0, cosine annealing schedule, final epoch checkpoint used for feature extraction
 - PCA: 256 components, fitted on training fold only
 - Embedding dimension: 256 per silo (768 total concatenation)
 - Head architecture: TopMLP — 768→512→1 with ReLU and Dropout(0.2)
@@ -141,7 +141,7 @@ for FOLD in 1 2 3 4 5; do
             --modality $MODALITY \
             --fold $FOLD \
             --out_dir byol_checkpoints \
-            --epochs 100 \
+            --epochs 20 \
             --batch_size 64 \
             --lr 3e-4 \
             --amp
@@ -167,7 +167,9 @@ Pre-train the active silo (dscope) with a supervised objective across all folds:
 python run_active_supervised_pretrain_vfl_folds.py \
     --fold_npz_dir fold_npz \
     --image_root /path/to/midas/images \
-    --out_dir sup_active_ckpts
+    --out_dir sup_active_ckpts \
+    --epochs 20 \
+    --batch_size 64
 ```
 
 Then extract features:
