@@ -268,7 +268,6 @@ def server_main(grid: Grid, context: Context) -> None:
     rounds   = int(_rcfg(run, "rounds", 100))
     batch    = int(_rcfg(run, "batch",  64))
     lr_top   = float(_rcfg(run, "lr_top", 1e-3))
-    patience = int(_rcfg(run, "patience", 15))
     emb_dim  = int(_rcfg(run, "emb_dim", 16))
 
     node_ids = get_node_ids(grid)
@@ -369,7 +368,6 @@ def server_main(grid: Grid, context: Context) -> None:
 
     best_val_auroc = -1.0
     best_round     = -1
-    no_improve     = 0
 
     best_path = str(out_dir / f"fusion_head_best_fold{fold}.pt")
     hist_path = str(out_dir / f"decoupled_fold{fold}_history.csv")
@@ -424,15 +422,6 @@ def server_main(grid: Grid, context: Context) -> None:
             best_val_auroc = val_auroc
             best_round     = rnd
             torch.save({"top": top.state_dict()}, best_path)
-            no_improve = 0
-        else:
-            no_improve += 1
-            if patience > 0 and no_improve >= patience:
-                print(
-                    f"[fold {fold}] early stop at round {rnd} "
-                    f"(no val AUROC improvement for {patience} rounds)"
-                )
-                break
 
     top.load_state_dict(torch.load(best_path, map_location=device)["top"])
     top.eval()
