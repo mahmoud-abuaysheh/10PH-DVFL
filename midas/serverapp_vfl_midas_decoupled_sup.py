@@ -5,11 +5,20 @@
 #                Passive silos use BYOL self-supervised encoders (6in, 1ft).
 # One-time embedding transfer then pure server-side supervised training.
 #
-# Env vars:
-#   ART_DIR_ACTIVE  — path to features_sup_active/  (supervised dscope features)
-#   ART_DIR_PASSIVE — path to features_byol/         (BYOL 6in + 1ft features)
-#   FOLD_NPZ_DIR    — path to fold_npz/              (labels)
-#   OUT_DIR         — output directory
+# Environment variables (set before running flwr run .):
+#   FOLD_NUM              — fold index (1-5)
+#   ART_DIR_ACTIVE        — path to features_sup_active/ (supervised dscope features)
+#   ART_DIR_PASSIVE       — path to byol_features_pca/   (BYOL 6in + 1ft features)
+#   FOLD_NPZ_DIR          — path to fold_npz/            (labels)
+#   OUT_DIR               — output directory
+#   SEED                  — random seed (default: 42)
+#   ROUNDS                — max training rounds (default: 20)
+#   EARLY_STOP_PATIENCE   — patience for early stopping (default: 7)
+#   BATCH_SIZE            — batch size (default: 64)
+#   HEAD_LR               — head learning rate (default: 1e-4)
+#   HEAD_WD               — head weight decay (default: 1e-4)
+#   HEAD_HIDDEN           — head hidden dim (default: 512)
+#   EMB_DIM               — embedding dim per silo (default: 256)
 from __future__ import annotations
 
 import csv, os
@@ -145,19 +154,19 @@ app = ServerApp()
 
 @app.main()
 def main(grid: Grid, context: Context) -> None:
-    # Hyperparams — identical to standard VFL
-    seed       = _env_int("SEED", 42)
-    fold       = _env_int("FOLD_NUM", 1)
-    emb_dim    = _env_int("EMB_DIM", 256)
-    rounds     = _env_int("ROUNDS", 20)
-    patience   = _env_int("EARLY_STOP_PATIENCE", 7)
-    min_delta  = _env_float("MIN_DELTA", 1e-4)
-    batch_size = _env_int("BATCH_SIZE", 2)
+    # Hyperparams
+    seed         = _env_int("SEED", 42)
+    fold         = _env_int("FOLD_NUM", 1)
+    emb_dim      = _env_int("EMB_DIM", 256)
+    rounds       = _env_int("ROUNDS", 20)
+    patience     = _env_int("EARLY_STOP_PATIENCE", 7)
+    min_delta    = _env_float("MIN_DELTA", 1e-4)
+    batch_size   = _env_int("BATCH_SIZE", 64)
     head_hidden  = _env_int("HEAD_HIDDEN", 512)
     head_dropout = _env_float("HEAD_DROPOUT", 0.2)
-    head_lr    = _env_float("HEAD_LR", 1e-4)
-    head_wd    = _env_float("HEAD_WD", 1e-4)
-    eval_every = _env_int("EVAL_EVERY", 1)
+    head_lr      = _env_float("HEAD_LR", 1e-4)
+    head_wd      = _env_float("HEAD_WD", 1e-4)
+    eval_every   = _env_int("EVAL_EVERY", 1)
 
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,8 +175,8 @@ def main(grid: Grid, context: Context) -> None:
     run_dir = out_dir / f"fold{fold}_sup_decoupled"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    log(INFO, "[SETUP] fold=%d seed=%d device=%s rounds=%d patience=%d batch=%d",
-        fold, seed, device, rounds, patience, batch_size)
+    log(INFO, "[SETUP] fold=%d seed=%d device=%s rounds=%d patience=%d batch=%d lr=%s",
+        fold, seed, device, rounds, patience, batch_size, head_lr)
 
     # ── Node assignment ───────────────────────────────────────────────────────
     node_ids = sorted(list(grid.get_node_ids()))
@@ -184,32 +193,23 @@ def main(grid: Grid, context: Context) -> None:
     else:
         active_dst, p6_dst, p1_dst = node_ids[0], node_ids[1], node_ids[2]
 
-    # Two separate feature directories:
-    #   active  → supervised pretrained dscope features
-    #   passive → BYOL pretrained 6in + 1ft features
-    art_dir_active  = os.environ.get("ART_DIR_ACTIVE",  "features_sup_active")
-    art_dir_passive = os.environ.get("ART_DIR_PASSIVE", "features_byol")
-
-    log(INFO, "[SETUP] active=%d(dscope) p6=%d(6in) p1=%d(1ft)",
+    log(INFO, "[SETUP] active=%d(dscope_sup) p6=%d(6in) p1=%d(1ft)",
         active_dst, p6_dst, p1_dst)
-    log(INFO, "[SETUP] active features: %s", art_dir_active)
-    log(INFO, "[SETUP] passive features: %s", art_dir_passive)
+    log(INFO, "[SETUP] active features: %s", os.environ.get("ART_DIR_ACTIVE", "features_sup_active"))
+    log(INFO, "[SETUP] passive features: %s", os.environ.get("ART_DIR_PASSIVE", "byol_features_pca"))
 
-    # NPZ filename prefix for supervised dscope is features_dscope_sup_fold{N}
-    # We tell each client which ART_DIR and prefix to use via modality tag
     rpc_set_modality(grid, active_dst, "dscope_sup")
     rpc_set_modality(grid, p6_dst,    "6in")
     rpc_set_modality(grid, p1_dst,    "1ft")
 
     # =========================================================================
-    # STAGE A — One-time embedding transfer (SS-VFL-I Algorithm 1 lines 2-5)
+    # STAGE A — One-time embedding transfer
     # =========================================================================
     log(INFO, "=== Stage A: One-time embedding transfer ===")
 
     total_comm_bytes = 0
     comm_log = []
-    cache  = {"dscope": {}, "6in": {}, "1ft": {}}
-    labels = {}
+    cache = {"dscope": {}, "6in": {}, "1ft": {}}
 
     for phase in ["train", "val", "test"]:
         for dst, mod in [(active_dst,"dscope"), (p6_dst,"6in"), (p1_dst,"1ft")]:
@@ -230,10 +230,9 @@ def main(grid: Grid, context: Context) -> None:
         "total_mb":    total_comm_bytes/1024**2,
     }])
 
-    # Load labels directly from fold_npz on server side
-    # (active_dscope_fold{N}.npz always has y_train/y_val/y_test)
+    # Load labels from fold_npz on server side
     fold_npz_dir = Path(os.environ.get("FOLD_NPZ_DIR", "fold_npz"))
-    active_npz = fold_npz_dir / f"active_dscope_fold{fold}.npz"
+    active_npz   = fold_npz_dir / f"active_dscope_fold{fold}.npz"
     log(INFO, "[StageA] Loading labels from %s", active_npz)
     ld = np.load(active_npz, allow_pickle=True)
     labels = {
@@ -241,7 +240,7 @@ def main(grid: Grid, context: Context) -> None:
         "val":   ld["y_val"].astype(np.int64),
         "test":  ld["y_test"].astype(np.int64),
     }
-    log(INFO, "[StageA] Labels loaded: train=%d val=%d test=%d",
+    log(INFO, "[StageA] Labels: train=%d val=%d test=%d",
         len(labels["train"]), len(labels["val"]), len(labels["test"]))
 
     def _concat(phase):
@@ -257,12 +256,9 @@ def main(grid: Grid, context: Context) -> None:
     y_test  = labels["test"]
 
     log(INFO, "[StageA] train=%s val=%s test=%s", X_train.shape, X_val.shape, X_test.shape)
-    log(INFO, "[StageA] label dist train=%s val=%s test=%s",
-        np.bincount(y_train), np.bincount(y_val), np.bincount(y_test))
 
     # =========================================================================
-    # STAGE B — Supervised training on cached embeddings (lines 6-10)
-    # No client communication from here.
+    # STAGE B — Supervised training on cached embeddings (no client comm)
     # =========================================================================
     log(INFO, "=== Stage B: Supervised training (no client comm) ===")
 
@@ -327,8 +323,8 @@ def main(grid: Grid, context: Context) -> None:
     val_auroc,  val_ap,  val_probs  = _eval_split(head, X_val,  y_val,  device, batch_size)
     test_auroc, test_ap, test_probs = _eval_split(head, X_test, y_test, device, batch_size)
 
-    thr_val  = _threshold_sweep(y_val,  val_probs,  step=0.01)
-    thr_test = _threshold_sweep(y_test, test_probs, step=0.01)
+    thr_val  = _threshold_sweep(y_val,  val_probs)
+    thr_test = _threshold_sweep(y_test, test_probs)
     _write_csv(run_dir/"threshold_metrics_val.csv",  thr_val)
     _write_csv(run_dir/"threshold_metrics_test.csv", thr_test)
 
