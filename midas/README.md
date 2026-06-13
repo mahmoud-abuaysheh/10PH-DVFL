@@ -126,27 +126,61 @@ pip install -e .
 
 ### Step 2 — Download MIDAS images
 
-Request access and download images from Stanford AIMI: https://aimi.stanford.edu/midas
+Download images from Stanford AIMI: https://stanfordaimi.azurewebsites.net/datasets/f4c2020f-801a-42dd-a477-a1a8357ef2a5
 
 ### Step 3 — Run BYOL pre-training (Condition 2)
 
-```bash
-# Pre-train all three silos with BYOL
-python train_byol_resnet50_midas_trainonly.py
+BYOL must be run separately for each modality and each fold (15 runs total):
 
-# Extract and compress features via PCA
-python extract_features_byol_midas.py
+```bash
+for FOLD in 1 2 3 4 5; do
+    for MODALITY in dscope 6in 1ft; do
+        python train_byol_resnet50_midas_trainonly.py \
+            --fold_npz_dir fold_npz \
+            --image_root /path/to/midas/images \
+            --modality $MODALITY \
+            --fold $FOLD \
+            --out_dir byol_checkpoints \
+            --epochs 100 \
+            --batch_size 64 \
+            --lr 3e-4 \
+            --amp
+    done
+done
+```
+
+Then extract and compress features via PCA (256 components, fitted on training fold only):
+
+```bash
+python extract_features_byol_midas.py \
+    --fold_npz_dir fold_npz \
+    --image_root /path/to/midas/images \
+    --ckpt_dir byol_checkpoints \
+    --out_dir byol_features_pca
 ```
 
 ### Step 4 — Run supervised pre-training (Condition 3 only)
 
-```bash
-# Pre-train active silo with supervised objective
-python run_active_supervised_pretrain_vfl_folds.py
+Pre-train the active silo (dscope) with a supervised objective across all folds:
 
-# Extract features
-python extract_features_sup_active.py
+```bash
+python run_active_supervised_pretrain_vfl_folds.py \
+    --fold_npz_dir fold_npz \
+    --image_root /path/to/midas/images \
+    --out_dir sup_active_ckpts
 ```
+
+Then extract features:
+
+```bash
+python extract_features_sup_active.py \
+    --fold_npz_dir fold_npz \
+    --image_root /path/to/midas/images \
+    --ckpt_dir sup_active_ckpts \
+    --out_dir features_sup_active
+```
+
+> **Note:** For Condition 3, passive silos (6in, 1ft) reuse the BYOL features from Step 3.
 
 ### Step 5 — Configure Flower and run Tier 2
 
@@ -160,7 +194,7 @@ options.backend.client-resources.num-cpus = 1
 options.backend.client-resources.num-gpus = 0.3
 ```
 
-Update `pyproject.toml` with the correct server and client scripts, then run:
+Update `pyproject.toml` with the correct server and client scripts, then run per fold:
 
 ```bash
 for FOLD in 1 2 3 4 5; do
@@ -174,7 +208,18 @@ done
 python run_vfl_splitnn_5fold.py \
     --fold_npz_dir fold_npz \
     --image_root /path/to/midas/images \
-    --out_dir runs_vfl_splitnn
+    --out_dir runs_vfl_splitnn \
+    --batch_size 64
+```
+
+### Step 7 — Run Centralized baseline (Condition 4)
+
+```bash
+python train_centralized_midas_e2e.py \
+    --fold_npz_dir fold_npz \
+    --image_root /path/to/midas/images \
+    --out_dir runs_centralized \
+    --batch_size 64
 ```
 
 ---
@@ -217,12 +262,6 @@ All experiments were run on **Ubuntu 22.04.5 LTS via WSL2 (Windows Subsystem for
 | flwr | 1.26.1 |
 | ray | 2.51.1 |
 | pillow | 12.0.0 |
-
-To install all dependencies:
-
-```bash
-pip install -e .
-```
 
 > **Note on GPU requirements:**
 > - **BYOL pre-training and feature extraction:** GPU required (ResNet50)
