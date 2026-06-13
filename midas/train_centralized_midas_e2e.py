@@ -11,12 +11,10 @@ Architecture (mirrors VFL split-NN exactly):
     concat(dscope_256, 6in_256, 1ft_256) → 768-D → OldMLP(768→512→1)
 
   ProjectionMLP: Linear(2048,512)→LayerNorm→GELU→Dropout(0.2)→Linear(512,256)
-    IDENTICAL to clientapp_vfl_midas_splitnn_proj256.py
-  OldMLP: Linear(768,512)→ReLU→Dropout(0.2)→Linear(512,1)
     IDENTICAL to serverapp_vfl_midas_splitnn_head.py
 
 Hyperparams (IDENTICAL to VFL splitnn):
-  lr=1e-4, wd=1e-4, batch=2, epochs=20, patience=7, min_delta=1e-4, seed=42
+  lr=1e-4, wd=1e-4, batch=64, epochs=20, patience=7, min_delta=1e-4, seed=42
 
 Splits: same 5-fold CV from fold_npz/ used in VFL splitnn
   active_dscope_fold{N}.npz  → paths + labels (train/val/test)
@@ -34,9 +32,9 @@ After all folds:
 
 Usage:
   python train_centralized_midas_e2e.py \
-      --image_root /mnt/c/Thesis/RAD/MIDAS_SkinCancer/midasmultimodalimagedatasetforaibasedskincancer \
-      --fold_npz_dir /mnt/c/Thesis/RAD/MIDAS_SkinCancer/resnet/scripts/fold_npz \
-      --out_dir /mnt/c/Thesis/RAD/MIDAS_SkinCancer/resnet/scripts/runs_centralized_e2e \
+      --image_root /path/to/midas/images \
+      --fold_npz_dir fold_npz \
+      --out_dir runs_centralized_e2e \
       --folds 1 2 3 4 5
 """
 from __future__ import annotations
@@ -65,7 +63,7 @@ PATIENCE    = 7
 MIN_ROUNDS  = 5
 MIN_DELTA   = 1e-4
 SEED        = 42
-EMB_DIM     = 256   # per modality output of ProjectionMLP
+EMB_DIM     = 256
 PROJ_HIDDEN = 512
 PROJ_DROP   = 0.2
 HEAD_HIDDEN = 512
@@ -141,7 +139,7 @@ class CentralizedModel(nn.Module):
                     for enc, x in zip(self.encoders, imgs)]
         else:
             embs = [enc(x) for enc, x in zip(self.encoders, imgs)]
-        fused = torch.cat(embs, dim=1)  # (B, 768)
+        fused = torch.cat(embs, dim=1)
         return self.head(fused)
 
 
@@ -154,7 +152,6 @@ class MultiModalDataset(Dataset):
         self.paths_list = paths_list
         self.labels     = labels
         self.transform  = transform
-        # Build fast case-insensitive lookup once (WSL/NTFS fix)
         self._lookup: Dict[str, Path] = {}
         for p in Path(image_root).rglob("*"):
             if p.is_file():
@@ -230,8 +227,7 @@ def pick_best(rows: List[dict], key: str) -> dict:
 
 
 @torch.no_grad()
-def eval_split(model: CentralizedModel, loader: DataLoader,
-               device: torch.device) -> Tuple[float, float, np.ndarray, np.ndarray]:
+def eval_split(model, loader, device):
     model.eval()
     all_probs, all_labels = [], []
     for d0, d1, d2, lbl in loader:
@@ -259,7 +255,6 @@ def run_fold(fold: int, args, device: torch.device) -> dict:
     out_dir      = Path(args.out_dir) / f"fold{fold}_centralized"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load fold splits (same NPZ files used in VFL) ─────────────────────────
     ad = np.load(fold_npz_dir / f"active_dscope_fold{fold}.npz", allow_pickle=True)
     p6 = np.load(fold_npz_dir / f"passive_6in_fold{fold}.npz",   allow_pickle=True)
     p1 = np.load(fold_npz_dir / f"passive_1ft_fold{fold}.npz",   allow_pickle=True)
@@ -281,10 +276,7 @@ def run_fold(fold: int, args, device: torch.device) -> dict:
     }
 
     print(f"[DATA] train={len(y_train)} val={len(y_val)} test={len(y_test)}")
-    print(f"[DATA] label dist  train={np.bincount(y_train)} "
-          f"val={np.bincount(y_val)} test={np.bincount(y_test)}")
 
-    # ── Transforms — identical to VFL client ──────────────────────────────────
     tf_train = transforms.Compose([
         transforms.Resize(256),
         transforms.RandomResizedCrop(224),
@@ -305,8 +297,6 @@ def run_fold(fold: int, args, device: torch.device) -> dict:
     test_ds  = MultiModalDataset(paths["test"],  y_test,  args.image_root, tf_eval)
 
     use_ckpt = args.batch_size >= 48 or args.grad_checkpointing
-    if use_ckpt:
-        print(f"[MODEL] Gradient checkpointing ENABLED (batch={args.batch_size})")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=False)
@@ -315,15 +305,10 @@ def run_fold(fold: int, args, device: torch.device) -> dict:
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False,
                               num_workers=args.num_workers, pin_memory=False)
 
-    # ── Model + optimizer ──────────────────────────────────────────────────────
     model     = CentralizedModel(use_checkpointing=use_ckpt).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
     criterion = nn.BCEWithLogitsLoss()
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[MODEL] 3x(ResNet50+ProjectionMLP) + OldMLP | params={n_params:,}")
-
-    # ── Training loop ──────────────────────────────────────────────────────────
     best_val_auroc = -1.0
     best_epoch     = 0
     bad            = 0
@@ -345,21 +330,19 @@ def run_fold(fold: int, args, device: torch.device) -> dict:
             optimizer.step()
             tr_losses.append(float(loss.item()))
 
-        avg_loss              = float(np.mean(tr_losses))
+        avg_loss                = float(np.mean(tr_losses))
         val_auroc, val_ap, _, _ = eval_split(model, val_loader, device)
 
         history.append(dict(epoch=epoch, train_loss=avg_loss,
                             val_auroc=val_auroc, val_prauc=val_ap))
         print(f"[Epoch {epoch:02d}/{MAX_EPOCHS}] loss={avg_loss:.4f} "
-              f"val_auroc={val_auroc:.4f} val_prauc={val_ap:.4f} "
-              f"({time.time()-t0:.1f}s)")
+              f"val_auroc={val_auroc:.4f} ({time.time()-t0:.1f}s)")
 
         if val_auroc > best_val_auroc + MIN_DELTA:
             best_val_auroc = val_auroc
             best_epoch     = epoch
             bad            = 0
             torch.save(model.state_dict(), best_path)
-            print(f"  → New best val_auroc={best_val_auroc:.4f} saved.")
         else:
             if epoch >= MIN_ROUNDS:
                 bad += 1
@@ -369,22 +352,17 @@ def run_fold(fold: int, args, device: torch.device) -> dict:
 
     write_csv(out_dir / "history.csv", history)
 
-    # ── Final evaluation ───────────────────────────────────────────────────────
     if best_path.exists():
         model.load_state_dict(torch.load(best_path, map_location=device,
                                          weights_only=False))
-        print(f"[FINAL] Loaded best model (epoch={best_epoch} "
-              f"val_auroc={best_val_auroc:.4f})")
 
     val_auroc,  val_ap,  val_probs,  y_val_np  = eval_split(model, val_loader,  device)
     test_auroc, test_ap, test_probs, y_test_np = eval_split(model, test_loader, device)
 
-    print(f"[RESULT] fold={fold} test_auroc={test_auroc:.4f} "
-          f"test_prauc={test_ap:.4f}")
+    print(f"[RESULT] fold={fold} test_auroc={test_auroc:.4f} test_prauc={test_ap:.4f}")
 
-    # ── Threshold sweep ────────────────────────────────────────────────────────
-    thr_val  = threshold_sweep(y_val_np,  val_probs,  step=0.01)
-    thr_test = threshold_sweep(y_test_np, test_probs, step=0.01)
+    thr_val  = threshold_sweep(y_val_np,  val_probs)
+    thr_test = threshold_sweep(y_test_np, test_probs)
     write_csv(out_dir / "threshold_metrics_val.csv",  thr_val)
     write_csv(out_dir / "threshold_metrics_test.csv", thr_test)
 
@@ -410,43 +388,22 @@ def run_fold(fold: int, args, device: torch.device) -> dict:
 def aggregate(summaries: List[dict], out_dir: Path):
     metrics = ["test_auroc", "test_pr_auc", "val_auroc", "val_pr_auc",
                "best_epoch", "val_thr_best_youden", "val_thr_best_f1"]
-
-    print(f"\n{'='*60}")
-    print("CENTRALIZED E2E — 5-FOLD RESULTS")
-    print(f"{'='*60}")
-    print(f"{'Fold':>5} {'AUROC':>8} {'PR-AUC':>8} {'Val AUROC':>10} {'Epoch':>6}")
-    print("-" * 45)
-    for s in summaries:
-        print(f"  {s['fold']:>3}  {s['test_auroc']:>8.4f} "
-              f"{s['test_pr_auc']:>8.4f} {s['val_auroc']:>10.4f} "
-              f"{int(s['best_epoch']):>6}")
-
     results = {}
     for k in metrics:
         vals = [float(s[k]) for s in summaries if k in s]
         if vals:
             results[k] = {"mean": float(np.mean(vals)), "std": float(np.std(vals))}
 
-    print(f"\nMean ± Std (5-fold CV):")
+    print(f"\n{'='*60}")
+    print("CENTRALIZED E2E — 5-FOLD RESULTS")
+    print(f"{'='*60}")
     for k, v in results.items():
         print(f"  {k:30s}: {v['mean']:.4f} ± {v['std']:.4f}")
 
     agg_path = out_dir / "test_summary_mean_std.csv"
     write_csv(agg_path, [{"metric": k, "mean": v["mean"], "std": v["std"]}
                           for k, v in results.items()])
-
-    print(f"\n{'='*60}")
-    print("THESIS RESULTS — Centralized E2E (upper bound)")
-    print(f"{'='*60}")
-    print(f"  Test AUROC  : "
-          f"{results['test_auroc']['mean']:.4f} ± {results['test_auroc']['std']:.4f}")
-    print(f"  Test PR-AUC : "
-          f"{results['test_pr_auc']['mean']:.4f} ± {results['test_pr_auc']['std']:.4f}")
-    print(f"  Val AUROC   : "
-          f"{results['val_auroc']['mean']:.4f} ± {results['val_auroc']['std']:.4f}")
-    print(f"  Avg epochs  : "
-          f"{results['best_epoch']['mean']:.1f} ± {results['best_epoch']['std']:.1f}")
-    print(f"\nSaved → {agg_path}")
+    print(f"Saved → {agg_path}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -458,13 +415,10 @@ def main():
     ap.add_argument("--fold_npz_dir", required=True)
     ap.add_argument("--out_dir",      required=True)
     ap.add_argument("--folds", type=int, nargs="+", default=[1,2,3,4,5])
-    ap.add_argument("--num_workers", type=int, default=0,
-                    help="0 for WSL/Windows")
+    ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--device", type=str, default="auto")
-    ap.add_argument("--batch_size", type=int, default=32,
-                    help="Batch size (gradient checkpointing auto-enabled for >=48)")
-    ap.add_argument("--grad_checkpointing", action="store_true",
-                    help="Force gradient checkpointing regardless of batch size")
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--grad_checkpointing", action="store_true")
     args = ap.parse_args()
 
     if args.device == "auto":
@@ -473,9 +427,6 @@ def main():
         device = torch.device(args.device)
 
     print(f"[SETUP] device={device} folds={args.folds}")
-    print(f"[SETUP] LR={LR} WD={WD} BATCH={args.batch_size} "
-          f"EPOCHS={MAX_EPOCHS} PATIENCE={PATIENCE} MIN_ROUNDS={MIN_ROUNDS} MIN_DELTA={MIN_DELTA}")
-
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     set_seed(SEED)
 
