@@ -118,7 +118,7 @@ clientapp = "clientapp_vfl_glioma_splitnn:app"
 
 ```bash
 for FOLD in 1 2 3 4 5; do
-    FOLD=$FOLD flwr run . local-simulation
+    FOLD=$FOLD flwr run . --federation local-simulation
 done
 ```
 
@@ -131,14 +131,14 @@ Run with K=10 and K=20 using the dedicated federation names. The npz path must b
 for FOLD in 1 2 3 4 5; do
     NPZ_PATH=/path/to/glioma_aligned_vfl_hfl_cv.npz \
     FOLD=$FOLD \
-    flwr run . local-simulation-k10
+    flwr run . --federation local-simulation-k10
 done
 
 # K=20
 for FOLD in 1 2 3 4 5; do
     NPZ_PATH=/path/to/glioma_aligned_vfl_hfl_cv.npz \
     FOLD=$FOLD \
-    flwr run . local-simulation-k20
+    flwr run . --federation local-simulation-k20
 done
 ```
 
@@ -176,6 +176,7 @@ After each fold completes, the HFL server saves:
 | `serverapp_vfl_glioma_decoupled.py` | Flower VFL server — Decoupled architecture (Conditions 2, 3, 4) |
 | `clientapp_vfl_glioma_decoupled.py` | Flower VFL client — Decoupled architecture (Conditions 2, 3, 4) |
 | `pyproject.toml` | Flower app configuration template |
+| `requirements.txt` | Python dependencies with exact versions |
 
 ---
 
@@ -197,6 +198,7 @@ All experiments were run on **Ubuntu 22.04.5 LTS via WSL2 (Windows Subsystem for
 To install all dependencies:
 
 ```bash
+pip install -r requirements.txt
 pip install -e .
 ```
 
