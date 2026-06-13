@@ -25,7 +25,7 @@
 # Key differences from serverapp_vfl_diabetes_decoupled.py:
 #   - Encoders are updated end-to-end through gradient feedback (steps 6-8)
 #   - Both activation and gradient tensors are transmitted every batch
-#   - Client encoder checkpoints are saved and restored for early stopping
+#   - Client encoder checkpoints are saved and restored for test evaluation
 
 from __future__ import annotations
 
@@ -182,7 +182,7 @@ def _restore_best_clients(
 ) -> None:
     """
     Instruct both client nodes to restore their encoder state from the
-    best checkpoint saved during training. Called after early stopping
+    best checkpoint saved during training. Called after training completes
     before final evaluation on the test set.
     """
     for node_id, view in [(active_id, 0), (passive_id, 1)]:
@@ -368,7 +368,6 @@ def server_main(grid: Grid, context: Context) -> None:
     rounds   = int(run.get("rounds", 100))
     batch    = int(run.get("batch", 256))
     lr_top   = float(run.get("lr_top", 1e-3))
-    patience = int(run.get("patience", 15))
 
     # Identify which grid nodes act as the active and passive silos.
     # Node IDs are sorted deterministically; active silo is always node 0.
@@ -398,7 +397,6 @@ def server_main(grid: Grid, context: Context) -> None:
 
     best_val_auroc = -1.0
     best_round = -1
-    no_improve = 0
 
     best_path = os.path.join(out_dir, f"splitnn_best_fold{fold}.pt")
     hist_path = os.path.join(out_dir, f"splitnn_fold{fold}_history.csv")
@@ -544,15 +542,6 @@ def server_main(grid: Grid, context: Context) -> None:
             best_round = rnd
             torch.save({"top": top.state_dict()}, best_path)
             _checkpoint_clients(grid, active_id, passive_id, fold, out_dir)
-            no_improve = 0
-        else:
-            no_improve += 1
-            if patience > 0 and no_improve >= patience:
-                print(
-                    f"[fold {fold}] early stop at round {rnd} "
-                    f"(no val AUROC improvement for {patience} rounds)"
-                )
-                break
 
     # Restore the best checkpoint for both the server and clients before
     # final evaluation on the held-out test set.
