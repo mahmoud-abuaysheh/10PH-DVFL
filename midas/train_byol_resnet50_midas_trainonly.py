@@ -11,8 +11,11 @@ Purpose:
   for checkpoint/model selection in downstream experiments.
 
 Outputs:
-- byol_{modality}_fold{fold}.best.pt
-- byol_{modality}_fold{fold}.pt
+- byol_{modality}_fold{fold}.pt  — final epoch encoder used for feature extraction
+
+Note: Following standard BYOL practice, the final epoch checkpoint is used
+for downstream feature extraction. The BYOL loss is governed by EMA dynamics
+and is not a reliable standalone checkpoint selection criterion.
 """
 
 from __future__ import annotations
@@ -278,6 +281,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"[BYOL] modality={args.modality} | fold={args.fold} | device={device}")
     print(f"[BYOL] epochs={args.epochs} | batch={args.batch_size} | lr={args.lr}")
     print(f"[BYOL] validation and test images are excluded from BYOL pretraining")
+    print(f"[BYOL] final epoch checkpoint will be used for feature extraction")
     print(f"{'=' * 70}")
 
     paths = load_pretrain_paths(args.fold_npz_dir, args.modality, args.fold)
@@ -340,10 +344,8 @@ def train(args: argparse.Namespace) -> None:
 
     out_dir = Path(args.out_dir)
     ckpt_final = out_dir / f"byol_{args.modality}_fold{args.fold}.pt"
-    ckpt_best = out_dir / f"byol_{args.modality}_fold{args.fold}.best.pt"
 
     global_step = 0
-    best_loss = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         online.train()
@@ -399,16 +401,11 @@ def train(args: argparse.Namespace) -> None:
             f"tau={tau_now:.4f}"
         )
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            save_encoder(online, ckpt_best)
-
+    # Save final epoch encoder — used for downstream feature extraction
     save_encoder(online, ckpt_final)
 
     print(f"\n[BYOL] Done: modality={args.modality} fold={args.fold}")
-    print(f"[BYOL] Best loss={best_loss:.4f}")
     print(f"[BYOL] Final checkpoint -> {ckpt_final}")
-    print(f"[BYOL] Best checkpoint  -> {ckpt_best}")
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +430,7 @@ def main() -> None:
     )
     parser.add_argument("--out_dir", required=True)
 
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
