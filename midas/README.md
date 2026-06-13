@@ -208,12 +208,25 @@ done
 
 ### Step 6 — Run SplitNN baseline (Condition 1)
 
+Update `pyproject.toml` with the SplitNN scripts:
+
+```toml
+[tool.flwr.app.components]
+serverapp = "serverapp_vfl_midas_splitnn_head:app"
+clientapp = "clientapp_vfl_midas_splitnn_proj256:app"
+```
+
+Then run per fold:
+
 ```bash
-python run_vfl_splitnn_5fold.py \
-    --fold_npz_dir fold_npz \
-    --image_root /path/to/midas/images \
-    --out_dir runs_vfl_splitnn \
-    --batch_size 64
+for FOLD in 1 2 3 4 5; do
+    FOLD_NUM=$FOLD \
+    IMAGE_ROOT=/path/to/midas/images \
+    FOLD_NPZ_DIR=fold_npz \
+    OUT_DIR=runs_midas_splitnn \
+    BATCH_SIZE=64 \
+    flwr run . --federation local-simulation
+done
 ```
 
 ### Step 7 — Run Centralized baseline (Condition 4)
@@ -244,7 +257,6 @@ python train_centralized_midas_e2e.py \
 | `clientapp_vfl_midas_decoupled_sup.py` | Flower VFL client — Decoupled SUP+SSL (Condition 3) |
 | `serverapp_vfl_midas_splitnn_head.py` | Flower VFL server — SplitNN baseline (Condition 1) |
 | `clientapp_vfl_midas_splitnn_proj256.py` | Flower VFL client — SplitNN baseline (Condition 1) |
-| `run_vfl_splitnn_5fold.py` | Runner script for SplitNN across all 5 folds |
 | `train_centralized_midas_e2e.py` | Centralized upper bound (Condition 4) |
 | `pyproject.toml` | Flower app configuration template |
 | `fold_npz/` | Pre-computed 5-fold CV splits (image paths + labels only, no image data) |
