@@ -273,21 +273,6 @@ def main():
                     help="Random seed for reproducibility")
     ap.add_argument("--device", default="cpu",
                     help="Device to use: cpu or cuda")
-    ap.add_argument("--patience", type=int, default=15,
-                    help="Early stopping patience based on validation AUROC")
-    ap.add_argument("--scheduler", choices=["none", "plateau"], default="plateau",
-                    help="Learning rate scheduler type")
-    ap.add_argument("--plateau_patience", type=int, default=5,
-                    help="ReduceLROnPlateau patience")
-    ap.add_argument("--plateau_factor", type=float, default=0.5,
-                    help="ReduceLROnPlateau reduction factor")
-    ap.add_argument("--min_lr", type=float, default=1e-6,
-                    help="Minimum learning rate for ReduceLROnPlateau")
-    ap.add_argument("--loss_eval_batch", type=int, default=4096,
-                    help="Batch size for loss evaluation (does not affect training)")
-    ap.add_argument("--print_thresholds", action="store_true",
-                    help="Print threshold-dependent metrics after each fold")
-    args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     set_seed(args.seed)
@@ -362,7 +347,7 @@ def main():
 
         hist_round, hist_train_loss, hist_val_loss = [], [], []
         hist_val_auroc, hist_val_prauc, hist_lr = [], [], []
-        no_improve, epochs_used = 0, 0
+        epochs_used = 0
 
         for rnd in range(1, args.rounds + 1):
             model.train()
@@ -381,8 +366,7 @@ def main():
                 loss.backward()
                 opt.step()
 
-            # Evaluate validation AUROC and PR-AUC for early stopping
-            # and learning rate scheduling.
+            # Evaluate validation AUROC and PR-AUC.
             val_auroc, val_prauc = evaluate_metrics(model, Xvan, yva, device)
             if scheduler is not None:
                 scheduler.step(val_auroc)
@@ -409,9 +393,7 @@ def main():
                 best_val_prauc = val_prauc
                 best_round = rnd
                 torch.save(model.state_dict(), best_path)
-                no_improve = 0
             else:
-                no_improve += 1
 
             epochs_used = rnd
 
@@ -423,14 +405,12 @@ def main():
                     f"best={best_val_auroc:.4f}@{best_round}  lr={get_lr(opt):.2e}"
                 )
 
-            if args.patience > 0 and no_improve >= args.patience:
                 print(
                     f"[fold {fold_i}] early stop at round {rnd} "
-                    f"(no val AUROC improvement for {args.patience} rounds)"
                 )
                 break
 
-        # Save the final model state regardless of early stopping.
+        # Save the final model state.
         torch.save(model.state_dict(), last_path)
 
         # Save per-fold training curves as a compressed NumPy archive.
