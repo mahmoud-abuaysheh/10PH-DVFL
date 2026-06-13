@@ -22,5 +22,5 @@ Each fold produces 3 NPZ files:
 
 ## Note
 
-These files contain only image filenames and binary labels — no actual image data.
+These files contain only image filenames and binary labels, no actual image data.
 Download MIDAS images from Stanford AIMI and point scripts to your local image directory.
