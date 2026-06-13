@@ -103,7 +103,7 @@ All conditions use fixed seed=42 and 5-fold stratified cross-validation.
 |-------|--------------|------------|-----------|---------------|----------------|
 | BYOL pre-training — all silos (Condition 2) | 20 epochs | 64 | AdamW | 3×10⁻⁴ | No — fixed schedule, final checkpoint used |
 | Supervised active pre-training (Condition 3) | 20 epochs | 64 | AdamW | 1×10⁻⁴ | Yes — patience=7 |
-| Decoupled Tier 2 — frozen encoders (Conditions 2, 3) | 20 rounds | 64 | Adam | 1×10⁻³ | Yes — patience=7 |
+| Decoupled Tier 2 — frozen encoders (Conditions 2, 3) | 20 rounds | 64 | Adam | 1×10⁻⁴ | Yes — patience=7 |
 | SplitNN (Condition 1) | 20 rounds | 64 | AdamW | 1×10⁻⁴ | Yes — patience=7 |
 | Centralized (Condition 4) | 20 epochs | 64 | AdamW | 1×10⁻⁴ | Yes — patience=7 |
 
