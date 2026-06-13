@@ -19,7 +19,6 @@
 #   - Stratified 5-fold cross-validation with fixed seed=42
 #   - Standardization using training split statistics only
 #   - Best checkpoint selected by validation AUROC
-#   - Early stopping disabled (patience=0) to match VFL which runs full 100 epochs
 #   - Learning rate scheduler disabled to match VFL fixed LR
 #   - Primary metrics: AUROC and PR-AUC (reported in the paper)
 #   - Secondary threshold-dependent metrics: accuracy, sensitivity, specificity,
@@ -255,8 +254,6 @@ def main() -> None:
                     help="Random seed for reproducibility")
     ap.add_argument("--device",   default="cpu",
                     help="Device to use: cpu or cuda")
-    ap.add_argument("--patience", type=int,   default=0,
-                    help="Early stopping patience (0 disables, matching VFL full 100 epochs)")
     ap.add_argument("--scheduler", choices=["none", "plateau"], default="none",
                     help="Learning rate scheduler (disabled to match VFL fixed LR)")
     ap.add_argument("--plateau_patience", type=int,   default=5,
@@ -312,7 +309,6 @@ def main() -> None:
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 opt, mode="max",
                 factor=args.plateau_factor,
-                patience=args.plateau_patience,
                 min_lr=args.min_lr,
             )
 
@@ -338,7 +334,6 @@ def main() -> None:
         hist_val_prauc  = []
         hist_lr         = []
 
-        no_improve  = 0
         epochs_used = 0
 
         for rnd in range(1, args.rounds + 1):
@@ -386,9 +381,7 @@ def main() -> None:
                 best_val_prauc = val_prauc
                 best_round     = rnd
                 torch.save(model.state_dict(), best_path)
-                no_improve = 0
             else:
-                no_improve += 1
 
             epochs_used = rnd
 
@@ -400,14 +393,12 @@ def main() -> None:
                     f"best={best_val_auroc:.4f}@{best_round}  lr={get_lr(opt):.2e}"
                 )
 
-            if args.patience > 0 and no_improve >= args.patience:
                 print(
                     f"[fold {fold_i}] early stop at round {rnd} "
-                    f"(no val AUROC improvement for {args.patience} rounds)"
                 )
                 break
 
-        # Save the final model state regardless of early stopping.
+        # Save the final model state at end of training.
         torch.save(model.state_dict(), last_path)
 
         # Save per-fold training curves as a compressed NumPy archive.
