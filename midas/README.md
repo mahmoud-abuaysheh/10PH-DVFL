@@ -58,17 +58,17 @@ This reads the raw MIDAS Excel metadata file and resolves image paths, producing
 
 > **Note on canonical selection:** Each patient may have multiple images per modality. This script selects one canonical image per modality per lesion deterministically by taking the first record after sorting by filename. Only lesions with all three modalities physically present and resolvable on disk are retained.
 
-### Step 2 — Generate per-fold NPZ files
+### Step 2 — Generate per-fold NPZ files (optional — for transparency only)
 
 ```bash
 python generate_midas_fold_npz.py \
     --table_csv aligned_canonical_table_validated.csv \
-    --fold_dir fold_npz \
+    --fold_dir fold_splits_5cv \
     --out_dir fold_npz \
     --verify
 ```
 
-> **Note:** If using the pre-computed `fold_npz/` files provided in this repository, you can skip Steps 1 and 2 entirely and proceed directly to pre-training.
+> **Note:** The pre-computed `fold_npz/` files are already provided in this repository. You do NOT need to run this script to reproduce the paper results. It is provided for transparency only and requires `fold_splits_5cv/fold{N}_indices.npz` files which are not included in this repository.
 
 ---
 
@@ -120,9 +120,15 @@ All conditions use fixed seed=42 and 5-fold stratified cross-validation.
 ### Step 1 — Install dependencies
 
 ```bash
+# Clone the repo and navigate to the midas folder
+git clone https://github.com/Mahmoud2231991/10PH-DVFL.git
+cd 10PH-DVFL/midas
+
 pip install -r requirements.txt
 pip install -e .
 ```
+
+> **Important:** All commands in this README must be run from the `midas/` directory so that `fold_npz/` is found correctly.
 
 ### Step 2 — Download MIDAS images
 
