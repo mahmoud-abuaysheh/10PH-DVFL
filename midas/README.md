@@ -153,10 +153,11 @@ Then extract and compress features via PCA (256 components, fitted on training f
 
 ```bash
 python extract_features_byol_midas.py \
+    --byol_dir byol_checkpoints \
     --fold_npz_dir fold_npz \
     --image_root /path/to/midas/images \
-    --ckpt_dir byol_checkpoints \
-    --out_dir byol_features_pca
+    --out_dir byol_features_pca \
+    --batch_size 64
 ```
 
 ### Step 4 — Run supervised pre-training (Condition 3 only)
@@ -176,10 +177,11 @@ Then extract features:
 
 ```bash
 python extract_features_sup_active.py \
+    --ckpt_dir sup_active_ckpts \
     --fold_npz_dir fold_npz \
     --image_root /path/to/midas/images \
-    --ckpt_dir sup_active_ckpts \
-    --out_dir features_sup_active
+    --out_dir features_sup_active \
+    --batch_size 64
 ```
 
 > **Note:** For Condition 3, passive silos (6in, 1ft) reuse the BYOL features from Step 3.
