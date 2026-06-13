@@ -1,17 +1,31 @@
 # serverapp_vfl_midas_splitnn_head.py
-# Changes vs original:
-#   - MIN_ROUNDS guard (=5) — early stopping only activates after round 5
-#   - Communication cost tracking per round and total (MB)
-#     Forward: 3 clients × batch × EMB_DIM × 4 bytes
-#     Backward: 3 clients × batch × EMB_DIM × 4 bytes
-#   - total_rounds, comm_cost_per_round_MB, comm_cost_total_MB in summary.csv
-#   - train_log.csv — per-round loss, val_auroc, val_prauc
-#   - Aggregation: run python serverapp_vfl_midas_splitnn_head.py --aggregate
+# Flower 1.26.1 compatible VFL SplitNN server for MIDAS.
+#
+# Protocol: Online SplitNN — per-batch embedding forward + gradient backward.
+# Each round: clients forward embeddings → server trains head → server pushes gradients back.
+#
+# Communication cost tracked per round and total (MB):
+#   Forward:  3 clients × batch × EMB_DIM × 4 bytes
+#   Backward: 3 clients × batch × EMB_DIM × 4 bytes
+#
+# Environment variables:
+#   FOLD_NUM              — fold index (1-5)
+#   FOLD_NPZ_DIR          — directory with fold NPZ files
+#   IMAGE_ROOT            — root directory of MIDAS images
+#   OUT_DIR               — output directory
+#   SEED                  — random seed (default: 42)
+#   ROUNDS                — max training rounds (default: 20)
+#   MIN_ROUNDS            — early stopping guard (default: 5)
+#   EARLY_STOP_PATIENCE   — patience (default: 7)
+#   BATCH_SIZE            — batch size (default: 64)
+#   EMB_DIM               — embedding dim per silo (default: 256)
+#   HEAD_HIDDEN           — head hidden dim (default: 512)
+#   HEAD_LR               — head learning rate (default: 1e-4)
+#   HEAD_WD               — head weight decay (default: 1e-4)
 from __future__ import annotations
 
 import os
 import csv
-import argparse
 from logging import INFO
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -29,40 +43,32 @@ from flwr.serverapp import Grid, ServerApp
 def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
 
-
 def _env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
 
 
-ART_DIR    = Path(os.environ.get("ART_DIR", ".")).resolve()
-EMB_DIM    = _env_int("EMB_DIM", 256)
-
-HEAD_HIDDEN  = _env_int("HEAD_HIDDEN", 512)
-HEAD_DROPOUT = _env_float("HEAD_DROPOUT", 0.2)
-HEAD_LR      = _env_float("HEAD_LR", 1e-4)
-HEAD_WD      = _env_float("HEAD_WD", 1e-4)
-
+EMB_DIM              = _env_int("EMB_DIM", 256)
+HEAD_HIDDEN          = _env_int("HEAD_HIDDEN", 512)
+HEAD_DROPOUT         = _env_float("HEAD_DROPOUT", 0.2)
+HEAD_LR              = _env_float("HEAD_LR", 1e-4)
+HEAD_WD              = _env_float("HEAD_WD", 1e-4)
 ROUNDS               = _env_int("ROUNDS", 20)
-MIN_ROUNDS           = _env_int("MIN_ROUNDS", 5)       # early stopping guard
+MIN_ROUNDS           = _env_int("MIN_ROUNDS", 5)
 SEED                 = _env_int("SEED", 42)
-DEVICE       = os.environ.get("DEVICE", "cpu")
-DEVICE_TORCH = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE           = _env_int("BATCH_SIZE", 2)
+DEVICE_TORCH         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE           = _env_int("BATCH_SIZE", 64)
 EVAL_EVERY           = _env_int("EVAL_EVERY", 1)
 EARLY_STOP_PATIENCE  = _env_int("EARLY_STOP_PATIENCE", 7)
 MIN_DELTA            = _env_float("MIN_DELTA", 1e-4)
 IMAGE_ROOT           = os.environ.get("IMAGE_ROOT", "")
 
-# ── Communication cost helpers ────────────────────────────────────────────────
-# Per batch, per direction (forward OR backward): 3 clients × B × EMB_DIM × float32
+
 def _comm_bytes_per_batch(batch_size: int) -> int:
-    """Bytes for ONE direction (forward embeddings OR backward gradients)."""
-    return 3 * batch_size * EMB_DIM * 4  # float32 = 4 bytes
+    return 3 * batch_size * EMB_DIM * 4
 
 def _comm_mb_per_round(n_train: int, batch_size: int) -> float:
-    """Total MB exchanged in one round (forward + backward per batch)."""
     n_batches   = int(np.ceil(n_train / batch_size))
-    bytes_round = n_batches * _comm_bytes_per_batch(batch_size) * 2  # ×2: fwd+bwd
+    bytes_round = n_batches * _comm_bytes_per_batch(batch_size) * 2
     return bytes_round / (1024 ** 2)
 
 
@@ -71,28 +77,23 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 def _grid_request(grid: Grid, msg: Message, timeout: int = 600) -> Message:
     reps = grid.send_and_receive([msg], timeout=timeout)
     if not reps or not reps[0].has_content():
-        raise RuntimeError("Client reply has no content (client crashed or raised).")
+        raise RuntimeError("Client reply has no content.")
     return reps[0]
-
 
 def _cfg(**kwargs) -> ConfigRecord:
     return ConfigRecord({k: v for k, v in kwargs.items()})
-
 
 def _sigmoid_np(x: np.ndarray) -> np.ndarray:
     x = x.astype(np.float64, copy=False)
     return 1.0 / (1.0 + np.exp(-x))
 
-
-def _threshold_sweep(y_true: np.ndarray, y_prob: np.ndarray,
-                     step: float = 0.01) -> List[Dict[str, float]]:
+def _threshold_sweep(y_true, y_prob, step=0.01):
     y_true = y_true.astype(int).reshape(-1)
     y_prob = y_prob.astype(float).reshape(-1)
-    rows: List[Dict[str, float]] = []
+    rows = []
     for thr in np.arange(0.0, 1.0001, step):
         yp   = (y_prob >= thr).astype(int)
         tp   = int(((y_true==1)&(yp==1)).sum())
@@ -112,27 +113,20 @@ def _threshold_sweep(y_true: np.ndarray, y_prob: np.ndarray,
         ))
     return rows
 
+def _pick_best(rows, key):
+    return sorted(rows, key=lambda r: (-float(r[key]), -float(r["f1"]),
+                                       -float(r["acc"]), float(r["threshold"])))[0]
 
-def _pick_best(rows: List[Dict[str, float]], key: str) -> Dict[str, float]:
-    return sorted(
-        rows,
-        key=lambda r: (-float(r[key]), -float(r["f1"]),
-                       -float(r["acc"]), float(r["threshold"]))
-    )[0]
-
-
-def _write_csv(path: Path, rows: List[Dict]) -> None:
-    if not rows:
-        return
+def _write_csv(path, rows):
+    if not rows: return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
+        w.writeheader(); w.writerows(rows)
 
 
 class OldMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int = 512, dropout: float = 0.2):
+    def __init__(self, in_dim, hidden=512, dropout=0.2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -140,9 +134,7 @@ class OldMLP(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, x): return self.net(x)
 
 
 app = ServerApp()
@@ -151,51 +143,44 @@ app = ServerApp()
 @app.main()
 def main(grid: Grid, context: Context) -> None:
     set_seed(SEED)
-    ART_DIR.mkdir(parents=True, exist_ok=True)
 
-    log(INFO, f"[SERVER] ART_DIR={ART_DIR}")
-    log(INFO, f"[SERVER] IMAGE_ROOT={IMAGE_ROOT}")
-    log(INFO, f"[SERVER] EMB_DIM={EMB_DIM} DEVICE={DEVICE_TORCH}")
-    log(INFO, f"[SERVER] ROUNDS={ROUNDS} MIN_ROUNDS={MIN_ROUNDS} "
-              f"BATCH_SIZE={BATCH_SIZE} EVAL_EVERY={EVAL_EVERY}")
-    log(INFO, f"[SERVER] HEAD_HIDDEN={HEAD_HIDDEN} HEAD_LR={HEAD_LR} HEAD_WD={HEAD_WD}")
+    fold    = _env_int("FOLD_NUM", 1)
+    out_dir = Path(os.environ.get("OUT_DIR", "runs_midas_splitnn"))
+    run_dir = out_dir / f"fold{fold}_vfl_splitnn"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    log(INFO, "[SERVER] fold=%d device=%s rounds=%d batch=%d lr=%s",
+        fold, DEVICE_TORCH, ROUNDS, BATCH_SIZE, HEAD_LR)
 
     node_ids_sorted = sorted(list(grid.get_node_ids()))
-    log(INFO, f"[SERVER] node_ids={node_ids_sorted}")
     if len(node_ids_sorted) < 3:
-        raise RuntimeError(f"Need 3 nodes, got {len(node_ids_sorted)}: {node_ids_sorted}")
+        raise RuntimeError(f"Need 3 nodes, got {len(node_ids_sorted)}")
 
-    roles: Dict[str, int] = {
+    roles = {
         "active": node_ids_sorted[0],
         "p6":     node_ids_sorted[1],
         "p1":     node_ids_sorted[2],
     }
-    log(INFO, f"[SERVER] assigned: active={roles['active']} "
-              f"p6={roles['p6']} p1={roles['p1']}")
 
-    # ── Init roles ────────────────────────────────────────────────────────────
     for role, nid in roles.items():
         msg = Message(
             content=RecordDict({"config": _cfg(role=role, image_root=IMAGE_ROOT)}),
             message_type="query.init_role",
             dst_node_id=nid,
         )
-        _ = _grid_request(grid, msg)
+        _grid_request(grid, msg)
 
-    # ── Labels from active client ─────────────────────────────────────────────
     meta_active = _request_meta(grid, roles["active"])
     y_train = torch.from_numpy(meta_active["y_train"]).float().view(-1, 1)
     y_val   = torch.from_numpy(meta_active["y_val"]).float().view(-1, 1)
     y_test  = torch.from_numpy(meta_active["y_test"]).float().view(-1, 1)
     n_train = len(y_train)
-    log(INFO, f"[SERVER] n_train={n_train} n_val={len(y_val)} n_test={len(y_test)}")
 
-    # ── Communication cost per round ──────────────────────────────────────────
     comm_mb_per_round = _comm_mb_per_round(n_train, BATCH_SIZE)
-    log(INFO, f"[SERVER] comm_cost_per_round={comm_mb_per_round:.4f} MB")
+    log(INFO, "[SERVER] n_train=%d n_val=%d n_test=%d comm/round=%.4f MB",
+        n_train, len(y_val), len(y_test), comm_mb_per_round)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    head      = OldMLP(in_dim=EMB_DIM * 3, hidden=HEAD_HIDDEN,
+    head      = OldMLP(in_dim=EMB_DIM*3, hidden=HEAD_HIDDEN,
                        dropout=HEAD_DROPOUT).to(DEVICE_TORCH)
     opt       = torch.optim.AdamW(head.parameters(), lr=HEAD_LR, weight_decay=HEAD_WD)
     criterion = nn.BCEWithLogitsLoss()
@@ -206,7 +191,6 @@ def main(grid: Grid, context: Context) -> None:
     bad            = 0
     train_log      = []
 
-    # ── Training loop ─────────────────────────────────────────────────────────
     for r in range(1, ROUNDS + 1):
         total_rounds = r
         head.train()
@@ -239,95 +223,75 @@ def main(grid: Grid, context: Context) -> None:
         avg_loss = total_loss / max(1, nb)
 
         if (r % EVAL_EVERY) == 0:
-            val_auroc, val_ap, _  = _eval_split(
-                grid, roles, head, y_val,  split="val",  return_probs=True)
-            test_auroc, test_ap, _ = _eval_split(
-                grid, roles, head, y_test, split="test", return_probs=True)
+            val_auroc,  val_ap,  _ = _eval_split(grid, roles, head, y_val,  "val")
+            test_auroc, test_ap, _ = _eval_split(grid, roles, head, y_test, "test")
 
-            train_log.append(dict(
-                round=r, train_loss=avg_loss,
+            train_log.append(dict(round=r, train_loss=avg_loss,
                 val_auroc=val_auroc, val_prauc=val_ap,
-                test_auroc=test_auroc, test_prauc=test_ap,
-            ))
+                test_auroc=test_auroc, test_prauc=test_ap))
 
-            log(INFO, f"[SERVER] round={r} loss={avg_loss:.4f} | "
-                      f"val AUROC={val_auroc:.4f} AP={val_ap:.4f} | "
-                      f"test AUROC={test_auroc:.4f} AP={test_ap:.4f}")
+            log(INFO, "[Round %02d/%d] loss=%.4f val_auroc=%.4f test_auroc=%.4f",
+                r, ROUNDS, avg_loss, val_auroc, test_auroc)
 
-            # Early stopping — only after MIN_ROUNDS
             if val_auroc > best_val_auroc + MIN_DELTA:
                 best_val_auroc = val_auroc
                 best_round     = r
                 bad            = 0
-                torch.save(head.state_dict(), ART_DIR / "head_best.pt")
+                torch.save(head.state_dict(), run_dir / "head_best.pt")
             else:
-                if r >= MIN_ROUNDS:   # guard: don't stop before MIN_ROUNDS
+                if r >= MIN_ROUNDS:
                     bad += 1
                     if bad >= EARLY_STOP_PATIENCE:
-                        log(INFO, f"[SERVER] Early stopping at round {r} "
-                                  f"(best val AUROC={best_val_auroc:.4f})")
+                        log(INFO, "[EarlyStopping] at round %d", r)
                         break
         else:
-            train_log.append(dict(
-                round=r, train_loss=avg_loss,
+            train_log.append(dict(round=r, train_loss=avg_loss,
                 val_auroc=None, val_prauc=None,
-                test_auroc=None, test_prauc=None,
-            ))
-            log(INFO, f"[SERVER] round={r} loss={avg_loss:.4f}")
+                test_auroc=None, test_prauc=None))
+            log(INFO, "[Round %02d/%d] loss=%.4f", r, ROUNDS, avg_loss)
 
-    _write_csv(ART_DIR / "train_log.csv", train_log)
+    _write_csv(run_dir / "train_log.csv", train_log)
 
-    # ── Load best head ─────────────────────────────────────────────────────────
-    ckpt = ART_DIR / "head_best.pt"
+    ckpt = run_dir / "head_best.pt"
     if ckpt.exists():
-        head.load_state_dict(torch.load(ckpt, map_location=DEVICE_TORCH,
-                                         weights_only=False))
-        log(INFO, f"[SERVER] Loaded best head (best_round={best_round})")
+        head.load_state_dict(torch.load(ckpt, map_location=DEVICE_TORCH, weights_only=False))
 
-    val_auroc,  val_ap,  val_probs  = _eval_split(
-        grid, roles, head, y_val,  split="val",  return_probs=True)
-    test_auroc, test_ap, test_probs = _eval_split(
-        grid, roles, head, y_test, split="test", return_probs=True)
+    val_auroc,  val_ap,  val_probs  = _eval_split(grid, roles, head, y_val,  "val")
+    test_auroc, test_ap, test_probs = _eval_split(grid, roles, head, y_test, "test")
 
     y_val_np  = y_val.numpy().reshape(-1)
     y_test_np = y_test.numpy().reshape(-1)
 
-    thr_val = _threshold_sweep(y_val_np,  val_probs,  step=0.01)
-    thr_te  = _threshold_sweep(y_test_np, test_probs, step=0.01)
-    _write_csv(ART_DIR / "threshold_metrics_val.csv",  thr_val)
-    _write_csv(ART_DIR / "threshold_metrics_test.csv", thr_te)
+    thr_val = _threshold_sweep(y_val_np,  val_probs)
+    thr_te  = _threshold_sweep(y_test_np, test_probs)
+    _write_csv(run_dir / "threshold_metrics_val.csv",  thr_val)
+    _write_csv(run_dir / "threshold_metrics_test.csv", thr_te)
 
-    best_val_you = _pick_best(thr_val, "youdenJ")
-    best_val_f1  = _pick_best(thr_val, "f1")
-
+    best_you = _pick_best(thr_val, "youdenJ")
+    best_f1  = _pick_best(thr_val, "f1")
     comm_total_mb = comm_mb_per_round * total_rounds
 
     summary = {
-        "best_round":              float(best_round),
-        "total_rounds":            float(total_rounds),
-        "val_auroc":               float(val_auroc),
-        "val_pr_auc":              float(val_ap),
-        "test_auroc":              float(test_auroc),
-        "test_pr_auc":             float(test_ap),
-        "val_thr_best_youden":     float(best_val_you["threshold"]),
-        "val_thr_best_f1":         float(best_val_f1["threshold"]),
-        "comm_cost_per_round_MB":  float(comm_mb_per_round),
-        "comm_cost_total_MB":      float(comm_total_mb),
+        "fold":                   fold,
+        "best_round":             best_round,
+        "total_rounds":           total_rounds,
+        "val_auroc":              val_auroc,
+        "val_pr_auc":             val_ap,
+        "test_auroc":             test_auroc,
+        "test_pr_auc":            test_ap,
+        "val_thr_best_youden":    best_you["threshold"],
+        "val_thr_best_f1":        best_f1["threshold"],
+        "comm_cost_per_round_MB": comm_mb_per_round,
+        "comm_cost_total_MB":     comm_total_mb,
     }
-    _write_csv(ART_DIR / "summary.csv", [summary])
+    _write_csv(run_dir / "summary.csv", [summary])
 
-    log(INFO, f"[SERVER] Final VAL  AUROC={val_auroc:.4f} AP={val_ap:.4f}")
-    log(INFO, f"[SERVER] Final TEST AUROC={test_auroc:.4f} AP={test_ap:.4f}")
-    log(INFO, f"[SERVER] best_round={best_round} total_rounds={total_rounds}")
-    log(INFO, f"[SERVER] comm/round={comm_mb_per_round:.4f} MB  "
-              f"comm_total={comm_total_mb:.4f} MB")
-    log(INFO, f"[SERVER] Wrote: head_best.pt, train_log.csv, "
-              f"threshold_metrics_val/test.csv, summary.csv")
+    log(INFO, "[RESULT] fold=%d test_auroc=%.4f test_prauc=%.4f "
+              "best_round=%d comm_total=%.4f MB",
+        fold, test_auroc, test_ap, best_round, comm_total_mb)
 
 
-# ── Helper functions ──────────────────────────────────────────────────────────
-
-def _request_meta(grid: Grid, active_node_id: int) -> Dict[str, np.ndarray]:
+def _request_meta(grid, active_node_id):
     msg = Message(content=RecordDict(),
                   message_type="query.meta", dst_node_id=active_node_id)
     rep  = _grid_request(grid, msg, timeout=600)
@@ -339,9 +303,8 @@ def _request_meta(grid: Grid, active_node_id: int) -> Dict[str, np.ndarray]:
     }
 
 
-def _get_embeddings_batch(grid: Grid, roles: Dict[str, int],
-                          split: str, idx_list: List[int]) -> torch.Tensor:
-    messages: List[Message] = []
+def _get_embeddings_batch(grid, roles, split, idx_list):
+    messages = []
     for role, nid in roles.items():
         pos = {"active": 0, "p6": 1, "p1": 2}[role]
         messages.append(Message(
@@ -350,54 +313,39 @@ def _get_embeddings_batch(grid: Grid, roles: Dict[str, int],
             message_type="query.get_embeddings",
             dst_node_id=nid,
         ))
-
     replies = grid.send_and_receive(messages, timeout=1200)
     if len(replies) != len(messages):
-        raise RuntimeError(f"Expected {len(messages)} embedding replies, "
-                           f"got {len(replies)}")
-
+        raise RuntimeError(f"Expected {len(messages)} replies, got {len(replies)}")
     bsz = len(idx_list)
     emb = torch.zeros((bsz, EMB_DIM * 3), dtype=torch.float32)
     for rep in replies:
         if not rep.has_content():
             raise RuntimeError("Client reply has no content.")
-        arrays = rep.content["arrays"]
-        pos    = int(rep.content["config"]["pos"])
-        x      = torch.from_numpy(arrays["embedding"].numpy()).float()
-        if x.shape[0] != bsz or x.shape[1] != EMB_DIM:
-            raise RuntimeError(f"Bad embedding shape {tuple(x.shape)} "
-                               f"expected ({bsz},{EMB_DIM})")
+        pos = int(rep.content["config"]["pos"])
+        x   = torch.from_numpy(rep.content["arrays"]["embedding"].numpy()).float()
         emb[:, pos * EMB_DIM:(pos + 1) * EMB_DIM] = x
     return emb
 
 
-def _push_gradients_batch(
-    grid: Grid, roles: Dict[str, int], split: str,
-    idx_list: List[int],
-    grad_chunks: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> None:
+def _push_gradients_batch(grid, roles, split, idx_list, grad_chunks):
     role_order = ["active", "p6", "p1"]
-    messages: List[Message] = []
+    messages = []
     for i, role in enumerate(role_order):
         nid  = roles[role]
         grad = grad_chunks[i].contiguous().numpy().astype(np.float32)
-        msg  = Message(
+        messages.append(Message(
             content=RecordDict({
                 "gradients": ArrayRecord({"local_gradients": Array(grad)}),
                 "config":    _cfg(split=split, indices=idx_list),
             }),
             message_type="train.apply_gradients",
             dst_node_id=nid,
-        )
-        messages.append(msg)
+        ))
     grid.push_messages(messages)
 
 
 @torch.no_grad()
-def _eval_split(
-    grid: Grid, roles: Dict[str, int], head: nn.Module,
-    y: torch.Tensor, split: str, return_probs: bool = False,
-) -> Tuple[float, float, np.ndarray]:
+def _eval_split(grid, roles, head, y, split):
     head.eval()
     n         = len(y)
     probs_all = np.zeros((n,), dtype=np.float32)
@@ -406,8 +354,7 @@ def _eval_split(
         emb      = _get_embeddings_batch(grid, roles, split=split,
                                           idx_list=idx_list).to(DEVICE_TORCH)
         logits   = head(emb).detach().cpu().numpy().reshape(-1)
-        probs    = _sigmoid_np(logits).astype(np.float32, copy=False)
-        probs_all[start:start + len(idx_list)] = probs
+        probs_all[start:start + len(idx_list)] = _sigmoid_np(logits)
     y_np  = y.numpy().reshape(-1)
     auroc = float(roc_auc_score(y_np, probs_all))
     ap    = float(average_precision_score(y_np, probs_all))
