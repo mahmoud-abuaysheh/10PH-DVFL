@@ -29,7 +29,7 @@
 # Key differences from serverapp_vfl_glioma_decoupled.py:
 #   - Encoders are updated end-to-end through gradient feedback each batch
 #   - Both activations and gradients cross silo boundaries every batch
-#   - Client encoder checkpoints are saved and restored for early stopping
+#   - Client encoder checkpoints are saved and restored for test evaluation
 
 from __future__ import annotations
 
@@ -355,7 +355,6 @@ def main(grid: Grid, context: Context) -> None:
     batch_size: int   = int(rc.get("batch_size", 64))
     epochs:     int   = int(os.environ.get("EPOCHS", rc.get("epochs", 100)))
     out_dim:    int   = int(rc.get("out_feature_dim", 16))
-    patience:   int   = int(rc.get("patience", 0))
 
     out_dir = Path(rc.get("out_dir",
                           str(Path(__file__).resolve().parent / "runs_splitnn_vfl_glioma")))
@@ -411,7 +410,6 @@ def main(grid: Grid, context: Context) -> None:
     best_val:        Dict          = {"epoch": 0, "val_loss": float("nan"),
                                       "val_auroc": float("nan"), "val_prauc": float("nan")}
     best_head_state: Optional[Dict] = None
-    no_improve   = 0
     rng          = np.random.default_rng(seed)
     global_step  = 0
     test_loss = test_auroc = test_prauc = float("nan")
@@ -543,15 +541,8 @@ def main(grid: Grid, context: Context) -> None:
                     {k: v.detach().cpu() for k, v in head.state_dict().items()}
                 )
                 _checkpoint_clients(grid, node_ids)
-                no_improve = 0
                 log(INFO, "[CKPT] ep=%d AUROC=%.4f — head and encoders saved",
                     ep, val_auroc)
-            else:
-                no_improve += 1
-                if patience > 0 and no_improve >= patience:
-                    log(INFO, "[EARLY STOP] ep=%d no improvement for %d epochs",
-                        ep, patience)
-                    break
 
         # ----------------------------------------------------------------
         # Restore best checkpoint and evaluate on the held-out test set
