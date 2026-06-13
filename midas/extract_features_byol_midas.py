@@ -1,8 +1,30 @@
 #!/usr/bin/env python3
 """
 extract_features_byol_midas.py
+-------------------------------
 Step 2: Extract BYOL features + PCA reduction for MIDAS decoupled VFL.
-Fixed: os.listdir called once (lookup dict) — fast on WSL/NTFS.
+
+Reads the final epoch BYOL encoder checkpoint (byol_{modality}_fold{N}.pt)
+and extracts 2048-D ResNet50 features, then reduces to 256-D via PCA
+fitted on the training fold only.
+
+Outputs per fold and modality:
+    features_{modality}_fold{N}.npz
+        X_train  (423, 256) float32
+        X_val    (105, 256) float32
+        X_test   (132, 256) float32
+        pca_variance (1,)   float32
+
+Usage:
+    python extract_features_byol_midas.py \
+        --byol_dir     byol_checkpoints \
+        --fold_npz_dir fold_npz \
+        --image_root   /path/to/midas/images \
+        --out_dir      byol_features_pca \
+        --pca_dim      256 \
+        --folds        1 2 3 4 5 \
+        --modalities   dscope 6in 1ft \
+        --batch_size   64
 """
 from __future__ import annotations
 import os, argparse
@@ -43,7 +65,8 @@ def resolve_from_lookup(lookup: Dict[str, str], filename: str) -> str:
 NPZ_NAME = {"dscope": "active_dscope", "6in": "passive_6in", "1ft": "passive_1ft"}
 
 def load_encoder(byol_dir: str, modality: str, fold: int, device: torch.device) -> nn.Module:
-    ckpt = Path(byol_dir) / f"byol_{modality}_fold{fold}.best.pt"
+    # Load final epoch checkpoint — used for feature extraction
+    ckpt = Path(byol_dir) / f"byol_{modality}_fold{fold}.pt"
     if not ckpt.exists():
         raise FileNotFoundError(f"Not found: {ckpt}")
     base = models.resnet50(weights=None)
@@ -76,7 +99,7 @@ class FeatureDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def extract_features(encoder, paths, lookup, device, batch_size=32, num_workers=0):
+def extract_features(encoder, paths, lookup, device, batch_size=64, num_workers=0):
     ds     = FeatureDataset(paths, lookup)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=(device.type=="cuda"))
@@ -164,14 +187,18 @@ def run_all(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--byol_dir",      required=True)
-    p.add_argument("--fold_npz_dir",  required=True)
-    p.add_argument("--image_root",    required=True)
-    p.add_argument("--out_dir",       required=True)
+    p.add_argument("--byol_dir",      required=True,
+                   help="Directory containing byol_{modality}_fold{N}.pt files")
+    p.add_argument("--fold_npz_dir",  required=True,
+                   help="Directory containing fold NPZ files (fold_npz/)")
+    p.add_argument("--image_root",    required=True,
+                   help="Root directory of MIDAS images")
+    p.add_argument("--out_dir",       required=True,
+                   help="Output directory for feature NPZ files")
     p.add_argument("--pca_dim",       type=int,   default=256)
     p.add_argument("--folds",         nargs="+",  type=int, default=[1,2,3,4,5])
     p.add_argument("--modalities",    nargs="+",  default=["dscope","6in","1ft"])
-    p.add_argument("--batch_size",    type=int,   default=32)
+    p.add_argument("--batch_size",    type=int,   default=64)
     p.add_argument("--num_workers",   type=int,   default=0)
     run_all(p.parse_args())
 
