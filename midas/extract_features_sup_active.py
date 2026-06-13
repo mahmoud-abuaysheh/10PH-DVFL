@@ -16,11 +16,12 @@ Passive silos (6in, 1ft) keep their original BYOL features unchanged.
 
 Usage:
     python extract_features_sup_active.py \
-        --ckpt_dir   sup_active_ckpts_vfl_folds \
-        --npz_dir    fold_npz \
-        --image_root "C:\path\to\images" \
+        --ckpt_dir   sup_active_ckpts \
+        --fold_npz_dir    fold_npz \
+        --image_root /path/to/midas/images \
         --out_dir    features_sup_active \
         --folds      1 2 3 4 5 \
+        --batch_size 64 \
         --device     cuda
 """
 from __future__ import annotations
@@ -54,6 +55,7 @@ def _build_lookup(image_root: str) -> None:
         return
     for fname in os.listdir(image_root):
         _lookup[fname.lower()] = os.path.join(image_root, fname)
+    print(f"[DATA] Lookup built: {len(_lookup)} files indexed")
 
 def resolve_image(image_root: str, filename: str) -> str:
     _build_lookup(image_root)
@@ -74,14 +76,13 @@ def load_backbone(ckpt_path: Path, device: torch.device) -> nn.Module:
     """
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    backbone     = models.resnet50(weights=None)
-    backbone.fc  = nn.Identity()
+    backbone    = models.resnet50(weights=None)
+    backbone.fc = nn.Identity()
 
     if "backbone_state_dict" in ckpt:
         backbone.load_state_dict(ckpt["backbone_state_dict"])
         print(f"  Loaded backbone_state_dict from {ckpt_path.name}")
     elif "state_dict" in ckpt:
-        # Strip head keys, keep only backbone
         sd = {k.replace("backbone.", ""): v
               for k, v in ckpt["state_dict"].items()
               if k.startswith("backbone.")}
@@ -104,7 +105,7 @@ def extract_features(
     image_root: str,
     transform,
     device:     torch.device,
-    batch_size: int = 32,
+    batch_size: int = 64,
 ) -> np.ndarray:
     """Extract 2048-D backbone features for a list of image filenames."""
     all_feats = []
@@ -117,14 +118,14 @@ def extract_features(
             path = resolve_image(image_root, str(fname))
             imgs.append(transform(Image.open(path).convert("RGB")))
 
-        x      = torch.stack(imgs).to(device)
-        feats  = backbone(x)                         # (B, 2048)
+        x     = torch.stack(imgs).to(device)
+        feats = backbone(x)                          # (B, 2048)
         all_feats.append(feats.cpu().numpy())
 
         if (start // batch_size) % 5 == 0:
             print(f"    Extracted {min(start+batch_size, n)}/{n} images...")
 
-    return np.concatenate(all_feats, axis=0).astype(np.float32)  # (N, 2048)
+    return np.concatenate(all_feats, axis=0).astype(np.float32)
 
 
 # ── PCA reduction ─────────────────────────────────────────────────────────────
@@ -197,10 +198,10 @@ def run_fold(
     X_train_raw = extract_features(backbone, paths_train, image_root,
                                    tf, device, args.batch_size)
     print("  Extracting val features...")
-    X_val_raw   = extract_features(backbone, paths_val,   image_root,
+    X_val_raw   = extract_features(backbone, paths_val, image_root,
                                    tf, device, args.batch_size)
     print("  Extracting test features...")
-    X_test_raw  = extract_features(backbone, paths_test,  image_root,
+    X_test_raw  = extract_features(backbone, paths_test, image_root,
                                    tf, device, args.batch_size)
 
     print(f"  Raw features: train={X_train_raw.shape} "
@@ -232,7 +233,7 @@ def main() -> None:
     )
     ap.add_argument("--ckpt_dir",   required=True,
                     help="Directory with pretrained_active_sup_fold{N}.pt files")
-    ap.add_argument("--npz_dir",    required=True,
+    ap.add_argument("--fold_npz_dir",    required=True,
                     help="fold_npz directory with active_dscope_fold{N}.npz files")
     ap.add_argument("--image_root", required=True,
                     help="Root directory of MIDAS images")
@@ -241,7 +242,7 @@ def main() -> None:
     ap.add_argument("--folds",      nargs="+", type=int, default=[1,2,3,4,5])
     ap.add_argument("--pca_dim",    type=int,   default=256,
                     help="PCA output dimension (must match BYOL features=256)")
-    ap.add_argument("--batch_size", type=int,   default=32)
+    ap.add_argument("--batch_size", type=int,   default=64)
     ap.add_argument("--device",     default="auto")
     ap.add_argument("--seed",       type=int,   default=42)
     args = ap.parse_args()
@@ -264,7 +265,7 @@ def main() -> None:
         run_fold(
             fold       = fold,
             ckpt_dir   = Path(args.ckpt_dir),
-            npz_dir    = Path(args.npz_dir),
+            npz_dir    = Path(args.fold_npz_dir),
             image_root = args.image_root,
             out_dir    = out_dir,
             args       = args,
@@ -278,9 +279,9 @@ def main() -> None:
     for fold in args.folds:
         p = out_dir / f"features_dscope_sup_fold{fold}.npz"
         print(f"  {p}")
-    print(f"\nNext step: run BYOL server script pointing to:")
-    print(f"  --art_dir {out_dir}  (for dscope)")
-    print(f"  Keep original features_byol dir for 6in and 1ft")
+    print(f"\nNext step: run decoupled VFL server/client pointing to:")
+    print(f"  --art_dir_active {out_dir}  (for dscope)")
+    print(f"  Keep original BYOL features dir for 6in and 1ft")
 
 
 if __name__ == "__main__":
