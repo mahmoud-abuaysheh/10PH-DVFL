@@ -48,8 +48,8 @@ This generates `partitions_K10_train.json` and `partitions_K20_train.json` in th
 
 | Silo | Features | Labels |
 |------|----------|--------|
-| Active (Silo 1) | Age, Hypertension, Heart disease, Gender (3 binary encoded columns) — 6 features total | Yes |
-| Passive (Silo 2) | BMI, HbA1c level, Blood glucose level, Smoking history (6 binary encoded columns) — 9 features total | No |
+| Active (Silo 1) | BMI, HbA1c level, Blood glucose level, Smoking history (6 binary encoded columns) — 9 features total | Yes |
+| Passive (Silo 2) | Age, Hypertension, Heart disease, Gender (3 binary encoded columns) — 6 features total | No |
 
 The passive silo has no access to labels at any stage.
 
