@@ -3,8 +3,8 @@
 This repository contains the code for the paper:
 
 > **10PH-DVFL: A Communication-Efficient Decoupled Vertical Federated Learning Architecture for Multimodal Precision Health (10P-Health)**
-> Submitted to the Journal of Artificial Intelligence Research (JAIR)
-
+> Submitted to the 14th International Workshop on e-Health Pervasive Wireless
+> Applications and Services (e-HPWAS'26), held in conjunction with IEEE WiMob 2026,
 ---
 
 ## Overview
