@@ -2,7 +2,7 @@
 
 This repository contains the code for the paper:
 
-> **10PH-DVFL: A Decoupled Vertical Federated Learning Architecture for Privacy-Preserving Multimodal Personalized Medicine**
+> **A Communication-Efficient Decoupled Vertical Federated Learning Architecture for Multimodal Precision Health (10P-Health)**
 > Submitted to the Journal of Artificial Intelligence Research (JAIR)
 
 ---
