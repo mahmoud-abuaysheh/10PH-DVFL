@@ -9,7 +9,7 @@ This repository contains the code for the paper:
 
 ## Overview
 
-10PH-DVFL is a decoupled Vertical Federated Learning (VFL) architecture designed for privacy-preserving multimodal personalized medicine. The architecture separates encoder pre-training (Tier 1) from cross-silo fusion (Tier 2), eliminating per-batch gradient communication and enabling asynchronous participation across healthcare silos.
+10PH-DVFL is a decoupled Vertical Federated Learning (VFL) architecture designed for communication-efficient multimodal precision health. The architecture separates encoder pre-training (Tier 1) from cross-silo fusion (Tier 2), eliminating per-batch gradient communication and enabling asynchronous participation across healthcare silos.
 
 The repository contains three independent experiments across different medical domains:
 
