@@ -1,4 +1,4 @@
-# 10PH-DVFL: A Decoupled Vertical Federated Learning Architecture for Privacy-Preserving Multimodal Precision Health (10P-Health)
+# 10PH-DVFL: A Communication-Efficient Decoupled Vertical Federated Learning Architecture for Multimodal Precision Health (10P-Health)
 
 This repository contains the code for the paper:
 
